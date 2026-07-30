@@ -1,0 +1,142 @@
+/* ===================================================================
+   popup.css — Web3 Gateway capture result popup
+   =================================================================== */
+
+:root {
+  --bg: #ffffff;
+  --bg2: #f5f7fa;
+  --ink: #1a1a2e;
+  --muted: #6b7280;
+  --rule: #e5e7eb;
+  --accent: #2563eb;
+  --success: #16a34a;
+  --warning: #ea580c;
+  --danger: #dc2626;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  width: 380px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--bg);
+  overflow-x: hidden;
+}
+
+#app { padding: 14px; }
+
+/* ---- Status bar ---- */
+#statusBar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+#statusIcon { font-size: 18px; flex-shrink: 0; }
+#statusText { flex: 1; }
+.status-time {
+  font-size: 11px;
+  font-weight: 400;
+  opacity: 0.7;
+  margin-left: auto;
+}
+
+.status-inactive { background: var(--bg2); color: var(--muted); }
+.status-capturing { background: #fff7ed; color: var(--warning); }
+.status-captured  { background: #eff6ff; color: var(--accent); }
+.status-completed { background: #eff6ff; color: var(--accent); }
+.status-error     { background: #fef2f2; color: var(--danger); }
+
+/* ---- Summary ---- */
+#summary { margin-bottom: 12px; }
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.summary-item {
+  text-align: center;
+  padding: 12px 4px;
+  background: var(--bg2);
+  border-radius: 8px;
+}
+.summary-value {
+  display: block;
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--accent);
+  line-height: 1.1;
+}
+.summary-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+/* ---- Action buttons ---- */
+.actions {
+  display: flex;
+  gap: 6px;
+}
+.btn {
+  padding: 6px 14px;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.2s;
+  flex: 1;
+}
+.btn:hover { opacity: 0.85; }
+.btn:active { opacity: 0.7; }
+.btn-sm { padding: 5px 10px; font-size: 12px; }
+.btn-primary   { background: var(--accent); color: #fff; }
+
+/* ---- File list ---- */
+.results-list {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+}
+.result-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--rule);
+  font-size: 12px;
+}
+.result-item:last-child { border-bottom: none; }
+.result-item:hover { background: var(--bg2); }
+
+.result-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.result-size {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---- General ---- */
+.hidden { display: none !important; }
+
+.results-list::-webkit-scrollbar { width: 5px; }
+.results-list::-webkit-scrollbar-thumb {
+  background: var(--rule);
+  border-radius: 3px;
+}

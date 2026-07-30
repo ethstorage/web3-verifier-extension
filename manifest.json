@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Web3 Gateway Proof - POC",
+  "version": "1.0",
+  "description": "Capture and verify static resources served by w3link.io / w3eth.io gateways via CDP. Currently implements data capture; proof verification is planned.",
+  "permissions": [
+    "debugger",
+    "webNavigation",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Web3 Gateway Proof"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

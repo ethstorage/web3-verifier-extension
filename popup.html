@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Web3 Gateway Capture</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Status bar -->
+    <div id="statusBar" class="status-inactive">
+      <span id="statusIcon">⊙</span>
+      <span id="statusText">Waiting for gateway page...</span>
+      <span id="statusTime" class="status-time"></span>
+    </div>
+
+    <!-- Summary: file count + total size + actions -->
+    <div id="summary" class="hidden">
+      <div class="summary-grid">
+        <div class="summary-item">
+          <span class="summary-value" id="sumTotal">0</span>
+          <span class="summary-label">Files</span>
+        </div>
+        <div class="summary-item">
+          <span class="summary-value" id="sumSize">0 B</span>
+          <span class="summary-label">Total Size</span>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="btnToggle" class="btn btn-primary btn-sm">Show Files</button>
+      </div>
+    </div>
+
+    <!-- File list (collapsed by default) -->
+    <div id="results" class="hidden">
+      <div id="resultsList" class="results-list"></div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
