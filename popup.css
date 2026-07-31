@@ -47,17 +47,19 @@ body {
   margin-left: auto;
 }
 
-.status-inactive { background: var(--bg2); color: var(--muted); }
-.status-capturing { background: #fff7ed; color: var(--warning); }
-.status-captured  { background: #eff6ff; color: var(--accent); }
-.status-completed { background: #eff6ff; color: var(--accent); }
-.status-error     { background: #fef2f2; color: var(--danger); }
+.status-inactive          { background: var(--bg2); color: var(--muted); }
+.status-user_nav_detected  { background: #fff7ed; color: var(--warning); }
+.status-blank_committed    { background: #fff7ed; color: var(--warning); }
+.status-navigating_target  { background: #fff7ed; color: var(--warning); }
+.status-capturing          { background: #fff7ed; color: var(--warning); }
+.status-completed          { background: #eff6ff; color: var(--accent); }
+.status-error              { background: #fef2f2; color: var(--danger); }
 
 /* ---- Summary ---- */
 #summary { margin-bottom: 12px; }
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
   gap: 6px;
   margin-bottom: 10px;
 }
@@ -73,6 +75,9 @@ body {
   font-weight: 800;
   color: var(--accent);
   line-height: 1.1;
+}
+.summary-value.missed-value {
+  color: var(--danger);
 }
 .summary-label {
   font-size: 11px;
@@ -124,6 +129,27 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--ink);
+}
+.result-tag {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.result-missed .result-tag {
+  background: #fef2f2;
+  color: var(--danger);
+}
+.result-fetch-error .result-tag {
+  background: #fff7ed;
+  color: var(--warning);
+}
+.result-missed .result-name {
+  color: var(--muted);
+}
+.result-fetch-error .result-name {
+  color: var(--muted);
 }
 .result-size {
   font-size: 11px;

@@ -18,6 +18,8 @@
 const $ = (id) => document.getElementById(id);
 
 let allResources = [];
+let missedResources = [];
+let failedBodies = [];
 let expanded = false;
 let pollingTimer = null;
 let activeTabId = null;       // tab currently focused by popup
@@ -78,10 +80,12 @@ async function refreshState() {
       'captured=', s.counts?.captured, 'activeCaptureId=', activeCaptureId);
     updateStatus(s);
 
-    if (s.state === 'capturing') {
+    if (s.state === 'user_nav_detected' || s.state === 'blank_committed' ||
+        s.state === 'navigating_target' ||
+        s.state === 'capturing') {
       await loadResults();
       schedulePoll(800); // fallback polling
-    } else if (s.state === 'completed') {
+    } else if (s.state === 'completed' || s.state === 'error') {
       stopPoll();
       await loadResults();
     } else {
@@ -110,21 +114,29 @@ function updateStatus(s) {
   const statusBar = $('statusBar');
   statusBar.className = 'status-' + s.state;
   const captured = s.counts && s.counts.captured != null ? s.counts.captured : 0;
+  const missed = s.counts && s.counts.missed != null ? s.counts.missed : 0;
+  const bodyFetchErrors = s.counts && s.counts.failedBodies != null ? s.counts.failedBodies : 0;
 
   switch (s.state) {
     case 'inactive':
       $('statusIcon').textContent = '\u2299';
-      $('statusText').textContent = 'Waiting for w3link.io / w3eth.io gateway...';
+      $('statusText').textContent = 'Waiting for gateway page...';
       $('statusTime').textContent = '';
       hide($('summary'));
       hide($('results'));
       break;
 
+    case 'user_nav_detected':
+    case 'blank_committed':
+    case 'navigating_target':
+      $('statusIcon').textContent = '\u25CF';
+      $('statusText').textContent = 'Setting up capture...';
+      $('statusTime').textContent = '';
+      break;
+
     case 'capturing':
       $('statusIcon').textContent = '\u25CF';
-      $('statusText').textContent = s.capturePhase === 'reload'
-        ? 'Reloading and capturing...'
-        : 'Capturing gateway traffic...';
+      $('statusText').textContent = 'Capturing gateway traffic...';
       $('statusTime').textContent = captured > 0 ? 'Captured ' + captured + ', waiting for idle' : '';
       break;
 
@@ -134,19 +146,21 @@ function updateStatus(s) {
         let qualityText = '';
         if (s.captureQuality === 'complete') qualityText = 'Complete';
         else if (s.captureQuality === 'partial') qualityText = 'Partial';
-        else if (s.capturePhase === 'reload') qualityText = 'Captured after reload';
-        const phaseText = s.capturePhase === 'reload' ? ' (reload)' : '';
-        $('statusText').textContent = 'Capture complete' + (qualityText ? ' \u2022 ' + qualityText : '');
-        $('statusTime').textContent = (s.durationMs
-          ? (s.durationMs / 1000).toFixed(1) + 's'
-          : '') + (phaseText ? ' ' + phaseText : '');
+        const gatewayText = s.gatewayName ? ' \u2022 ' + s.gatewayName : '';
+        $('statusText').textContent = 'Capture ' + (qualityText || 'done');
+        let timeInfo = '';
+        if (s.durationMs) timeInfo = (s.durationMs / 1000).toFixed(1) + 's';
+        if (missed > 0) timeInfo += ' \u2022 ' + missed + ' missed';
+        if (bodyFetchErrors > 0) timeInfo += ' \u2022 ' + bodyFetchErrors + ' fetch err';
+        $('statusTime').textContent = (timeInfo || '') + gatewayText;
       }
       break;
 
     case 'error':
       $('statusIcon').textContent = '\u2717';
       $('statusText').textContent = s.error || 'Error occurred';
-      $('statusTime').textContent = captured > 0 ? 'Captured ' + captured : '';
+      $('statusTime').textContent = (captured > 0 ? 'Captured ' + captured : '')
+        + (bodyFetchErrors > 0 ? ' \u2022 ' + bodyFetchErrors + ' fetch err' : '');
       break;
   }
 }
@@ -161,14 +175,24 @@ async function loadResults() {
     return;
   }
   allResources = (res && res.resources) || [];
-  const summary = (res && res.summary) || { total: 0, totalSize: 0 };
-  console.log('[POPUP] loadResults', 'total=', summary.total, 'byType=', JSON.stringify(summary.byType),
-    'captureId=', res?.captureId);
+  missedResources = (res && res.missedResources) || [];
+  failedBodies = (res && res.failedBodies) || [];
+  const summary = (res && res.summary) || { total: 0, totalSize: 0, missed: 0, failedBodies: 0 };
+  console.log('[POPUP] loadResults', 'total=', summary.total, 'missed=', summary.missed,
+    'failedBodies=', summary.failedBodies,
+    'byType=', JSON.stringify(summary.byType), 'captureId=', res?.captureId);
 
   $('sumTotal').textContent = summary.total;
   $('sumSize').textContent = formatBytes(summary.totalSize);
+  if (summary.missed > 0) {
+    $('sumMissed').textContent = summary.missed;
+    show($('sumMissedItem'));
+  } else {
+    hide($('sumMissedItem'));
+  }
 
-  if (allResources.length > 0) {
+  const hasAny = allResources.length > 0 || missedResources.length > 0 || failedBodies.length > 0;
+  if (hasAny) {
     show($('summary'));
     updateToggleButton();
     if (expanded) {
@@ -195,7 +219,8 @@ function toggleExpand() {
 
 function updateToggleButton() {
   const btn = $('btnToggle');
-  if (allResources.length === 0) {
+  const total = allResources.length + missedResources.length + failedBodies.length;
+  if (total === 0) {
     btn.textContent = 'Show Files';
     btn.disabled = true;
     return;
@@ -203,23 +228,50 @@ function updateToggleButton() {
   btn.disabled = false;
   btn.textContent = expanded
     ? 'Hide Files'
-    : `Show Files (${allResources.length})`;
+    : `Show Files (${total})`;
 }
 
 function renderList() {
   const list = $('resultsList');
-  list.innerHTML = allResources
-    .map((r) => {
-      const name = escapeHtml(fileName(r.url));
-      const fullUrl = escapeHtml(r.url);
-      const sizeStr = formatBytes(r.size);
-      return `
-        <div class="result-item" title="${fullUrl}">
-          <span class="result-name">${name}</span>
-          <span class="result-size">${sizeStr}</span>
-        </div>`;
-    })
-    .join('');
+  const items = [];
+
+  // Captured resources
+  allResources.forEach((r) => {
+    const name = escapeHtml(fileName(r.url));
+    const fullUrl = escapeHtml(r.url);
+    const sizeStr = formatBytes(r.size);
+    items.push(`
+      <div class="result-item" title="${fullUrl}">
+        <span class="result-name">${name}</span>
+        <span class="result-size">${sizeStr}</span>
+      </div>`);
+  });
+
+  // Missed resources
+  missedResources.forEach((r) => {
+    const name = escapeHtml(fileName(r.url));
+    const fullUrl = escapeHtml(r.url);
+    items.push(`
+      <div class="result-item result-missed" title="${fullUrl}">
+        <span class="result-tag">MISSED</span>
+        <span class="result-name">${name}</span>
+        <span class="result-size">${r.type}</span>
+      </div>`);
+  });
+
+  // Body fetch errors
+  failedBodies.forEach((r) => {
+    const name = escapeHtml(fileName(r.url));
+    const fullUrl = escapeHtml(r.url);
+    items.push(`
+      <div class="result-item result-fetch-error" title="${fullUrl}">
+        <span class="result-tag">FETCH ERR</span>
+        <span class="result-name">${name}</span>
+        <span class="result-size">${r.type}</span>
+      </div>`);
+  });
+
+  list.innerHTML = items.join('');
 }
 
 // ---- Utilities ----
