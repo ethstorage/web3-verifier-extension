@@ -237,9 +237,10 @@ function renderList() {
     const fullUrl = escapeHtml(r.url);
     const sizeStr = formatBytes(r.size);
     items.push(`
-      <div class="result-item" title="${fullUrl}">
+      <div class="result-item" data-url="${fullUrl}">
         <span class="result-name">${name}</span>
         <span class="result-size">${sizeStr}</span>
+        <span class="result-tooltip">${fullUrl}</span>
       </div>`);
   });
 
@@ -248,10 +249,11 @@ function renderList() {
     const name = escapeHtml(fileName(r.url));
     const fullUrl = escapeHtml(r.url);
     items.push(`
-      <div class="result-item result-missed" title="${fullUrl}">
+      <div class="result-item result-missed" data-url="${fullUrl}">
         <span class="result-tag">MISSED</span>
         <span class="result-name">${name}</span>
         <span class="result-size">${r.type}</span>
+        <span class="result-tooltip">${fullUrl}</span>
       </div>`);
   });
 
@@ -260,10 +262,11 @@ function renderList() {
     const name = escapeHtml(fileName(r.url));
     const fullUrl = escapeHtml(r.url);
     items.push(`
-      <div class="result-item result-fetch-error" title="${fullUrl}">
+      <div class="result-item result-fetch-error" data-url="${fullUrl}">
         <span class="result-tag">FETCH ERR</span>
         <span class="result-name">${name}</span>
         <span class="result-size">${r.type}</span>
+        <span class="result-tooltip">${fullUrl}</span>
       </div>`);
   });
 

@@ -4,7 +4,7 @@
 // Design:
 //   1. initPermanentRules() — permanent redirect rules, send gateway main_frame
 //      to chrome-extension://<id>/blank.html#<url>
-//      Rules re-added on every service worker start (same ID replaces), persisted.
+//      Old rules are removed before re-adding to handle persistence across restarts.
 //   2. addSessionAllowRule(tabId) — high-priority session allow rule,
 //      added before Page.navigate to prevent second navigation from being intercepted.
 //   3. removeSessionAllowRule(tabId) — cleanup session allow rule.
@@ -64,7 +64,7 @@ const PERMANENT_RULE_IDS = PERMANENT_RULES.map(r => r.id);
 
 /**
  * Initialize permanent DNR rules. Called on every service worker start.
- * Dynamic rules persist in browser process; same-ID replacement ensures idempotency.
+ * Dynamic rules persist across restarts, so old rules must be removed first.
  */
 export async function initPermanentRules() {
   try {
@@ -73,7 +73,9 @@ export async function initPermanentRules() {
       removeRuleIds: [SESSION_ALLOW_RULE_ID],
     });
 
+    // Remove old rules with same IDs, then add current definitions
     await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: PERMANENT_RULE_IDS,
       addRules: PERMANENT_RULES,
     });
     console.log('[DNR] permanent rules initialized:', PERMANENT_RULES.length, 'rules');

@@ -121,6 +121,7 @@ body {
   padding: 7px 10px;
   border-bottom: 1px solid var(--rule);
   font-size: 12px;
+  position: relative;
 }
 .result-item:last-child { border-bottom: none; }
 .result-item:hover { background: var(--bg2); }
@@ -131,6 +132,25 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--ink);
+}
+.result-tooltip {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 8px;
+  right: 8px;
+  padding: 4px 8px;
+  background: #1a1a2e;
+  color: #fff;
+  font-size: 11px;
+  border-radius: 4px;
+  word-break: break-all;
+  line-height: 1.4;
+  z-index: 10;
+  pointer-events: none;
+}
+.result-item:hover .result-tooltip {
+  display: block;
 }
 .result-tag {
   font-size: 10px;
