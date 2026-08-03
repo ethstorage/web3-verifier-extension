@@ -1,7 +1,7 @@
 // =============================================================================
-// gateway-config.js — Gateway allowlist 配置
+// gateway-config.js — Gateway allowlist
 // =============================================================================
-// 新增 gateway 只需在此数组中添加条目，webRequest 和 CDP 自动生效。
+// Add new gateways here; webRequest and CDP pick them up automatically.
 // =============================================================================
 
 export const GATEWAY_CONFIG = [

@@ -1,15 +1,15 @@
 // =============================================================================
-// background.js — 状态机驱动的 gateway 资源捕获
+// background.js — state-machine-driven gateway resource capture
 // =============================================================================
-// 架构：
-//   1. DNR 永久规则重定向 gateway main_frame → chrome-extension://<id>/blank.html#<url>
-//   2. blank.html 加载后通知 background (interstitialReady)
-//   3. background attach CDP + 注册 listener + 添加 session allow rule
-//   4. Page.navigate(targetUrl) → session allow rule 绕过 DNR
-//   5. 网关 URL committed 后移除 session allow rule，开始捕获
-//   6. webRequest 作为独立审计日志
+// Architecture:
+//   1. DNR permanent rules redirect gateway main_frame → chrome-extension://<id>/blank.html#<url>
+//   2. blank.html signals background via interstitialReady message
+//   3. background attaches CDP, registers listener, adds session allow rule
+//   4. Page.navigate(targetUrl) → session allow rule bypasses DNR
+//   5. Gateway URL committed → remove session allow rule → start capture
+//   6. webRequest serves as independent audit log
 //
-// 状态机：
+// State machine:
 //   USER_NAV_DETECTED → INTERSTITIAL_COMMITTED → CDP_ATTACHING → READY
 //                                                                    ↓
 //                                                             NAVIGATING_TARGET
@@ -133,18 +133,21 @@ class CaptureRecord {
     this.idleTimer = null;
     this.maxTimer = null;
     this.interstitialTimer = null;
+
+    // Child target session management (worker / service_worker / OOPIF)
+    // targetId → { type, url, sessionId }
+    this.childTargets = new Map();
   }
 }
 
 // ============================================================================
 // onBeforeNavigate — detect user gateway navigation
 // ============================================================================
-// DNR 重定向到 blank.html 后，此事件收到原始 gateway URL。创建 capture session。
+// After DNR redirects to blank.html, this event receives the original gateway URL.
+// Creates a new capture session.
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   if (details.frameId !== 0) return;
   const { tabId, url } = details;
-
-  console.log('[NAV] onBeforeNavigate', Date.now(), 'tabId=', tabId, 'url=', url.slice(0, 120));
 
   // Ignore extension pages (blank.html interstitial)
   if (url.startsWith('chrome-extension://')) return;
@@ -154,7 +157,6 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   // Internal navigation: Page.navigate to targetUrl
   if (existing) {
     if (existing.state === ST.NAVIGATING_TARGET && url === existing.targetUrl) {
-      console.log('[NAV] onBeforeNavigate: internal Page.navigate, ignoring');
       return;
     }
     // User navigated away during active capture
@@ -169,7 +171,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
 
   // New gateway navigation
   if (existing) await disposeRecord(tabId);
-  console.log('[CAPTURE] user navigation detected', Date.now(), 'tabId=', tabId,
+  console.log('[CAPTURE] user navigation detected', 'tabId=', tabId,
     'url=', url.slice(0, 120));
   const newRecord = new CaptureRecord(tabId, url);
   captures.set(tabId, newRecord);
@@ -195,6 +197,7 @@ chrome.webRequest.onBeforeRequest.addListener(
     }
     const cdpReady = record.cdpReadyAt != null;
     const phase = cdpReady ? 'C' : 'A';
+    const wReqNormKey = normalizeResourceKey(details.url, details.type);
     log.push({
       requestId: details.requestId,
       url: details.url,
@@ -205,14 +208,8 @@ chrome.webRequest.onBeforeRequest.addListener(
       gatewayId: gw.gatewayId,
       cdpReady,
       phase,
+      _normKey: wReqNormKey,
     });
-    console.log('[WEBREQ] seen', Date.now(),
-      'captureId=', record.captureId,
-      'phase=', phase,
-      'requestId=', details.requestId,
-      'type=', details.type,
-      'cdpReady=', cdpReady,
-      'url=', details.url.slice(0, 120));
   },
   { urls: getWebRequestUrlPatterns() }
 );
@@ -222,43 +219,48 @@ chrome.webRequest.onBeforeRequest.addListener(
 // ============================================================================
 async function setupCdp(tabId, record) {
   record.setupTiming.attachStartAt = Date.now();
-  console.log('[TIMING] debugger.attach START', record.setupTiming.attachStartAt, 'tabId=', tabId);
   await chrome.debugger.detach({ tabId }).catch(() => {});
   await chrome.debugger.attach({ tabId }, '1.3');
   record.setupTiming.attachEndAt = Date.now();
-  console.log('[TIMING] debugger.attach END', record.setupTiming.attachEndAt,
-    'elapsed=', record.setupTiming.attachEndAt - record.setupTiming.attachStartAt, 'ms');
+
+  // Auto-attach child targets (worker / service_worker / OOPIF)
+  // Must be called before Network.enable so that child target Network
+  // events are captured from the moment they are created.
+  await chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', {
+    autoAttach: true,
+    waitForDebuggerOnStart: false,
+    flatten: true,
+  });
 
   record.setupTiming.networkEnableStartAt = Date.now();
-  console.log('[TIMING] Network.enable START', record.setupTiming.networkEnableStartAt, 'tabId=', tabId);
   await chrome.debugger.sendCommand({ tabId }, 'Network.enable');
   record.setupTiming.networkEnableEndAt = Date.now();
   record.cdpReadyAt = record.setupTiming.networkEnableEndAt;
-  console.log('[TIMING] Network.enable END', record.setupTiming.networkEnableEndAt,
-    'elapsed=', record.setupTiming.networkEnableEndAt - record.setupTiming.networkEnableStartAt, 'ms');
 
   record.setupTiming.pageEnableStartAt = Date.now();
-  console.log('[TIMING] Page.enable START', record.setupTiming.pageEnableStartAt, 'tabId=', tabId);
   await chrome.debugger.sendCommand({ tabId }, 'Page.enable');
   record.setupTiming.pageEnableEndAt = Date.now();
-  console.log('[TIMING] Page.enable END', record.setupTiming.pageEnableEndAt,
-    'elapsed=', record.setupTiming.pageEnableEndAt - record.setupTiming.pageEnableStartAt, 'ms');
+
+  console.log('[CAPTURE] CDP setup done', 'tabId=', tabId,
+    'attach=', (record.setupTiming.attachEndAt - record.setupTiming.attachStartAt), 'ms',
+    'network=', (record.setupTiming.networkEnableEndAt - record.setupTiming.networkEnableStartAt), 'ms',
+    'page=', (record.setupTiming.pageEnableEndAt - record.setupTiming.pageEnableStartAt), 'ms');
 
   record.onEvent = (source, method, params) => {
     if (source.tabId !== tabId) return;
     const current = captures.get(tabId);
     if (!current || current.captureId !== record.captureId) return;
-    handleCdpEvent(tabId, record.captureId, method, params).catch((err) => {
+    handleCdpEvent(tabId, record.captureId, method, params, source).catch((err) => {
       console.warn('[CAPTURE] CDP event error:', err);
     });
   };
   chrome.debugger.onEvent.addListener(record.onEvent);
-  console.log('[CAPTURE] CDP listener registered', Date.now(), 'tabId=', tabId,
+  console.log('[CAPTURE] CDP listener registered', 'tabId=', tabId,
     'captureId=', record.captureId);
 }
 
 // ============================================================================
-// handleInterstitialReady — blank.html 通知 background
+// handleInterstitialReady — blank.html signals background
 // ============================================================================
 async function handleInterstitialReady(tabId, targetUrl) {
   const record = captures.get(tabId);
@@ -273,7 +275,7 @@ async function handleInterstitialReady(tabId, targetUrl) {
     return;
   }
 
-  console.log('[CAPTURE] interstitialReady received', Date.now(), 'tabId=', tabId,
+  console.log('[CAPTURE] interstitialReady received', 'tabId=', tabId,
     'captureId=', record.captureId, 'prevState=', record.state,
     'targetUrl=', targetUrl.slice(0, 120));
 
@@ -294,14 +296,12 @@ async function handleInterstitialReady(tabId, targetUrl) {
 
     transitionTo(record, ST.NAVIGATING_TARGET, 'Page.navigate');
     record.setupTiming.pageNavigateStartAt = Date.now();
-    console.log('[TIMING] Page.navigate START', record.setupTiming.pageNavigateStartAt,
-      'tabId=', tabId, 'url=', targetUrl.slice(0, 120));
     await chrome.debugger.sendCommand({ tabId }, 'Page.navigate', { url: targetUrl });
     record.setupTiming.pageNavigateEndAt = Date.now();
-    console.log('[TIMING] Page.navigate END', record.setupTiming.pageNavigateEndAt,
-      'elapsed=', record.setupTiming.pageNavigateEndAt - record.setupTiming.pageNavigateStartAt, 'ms');
+    console.log('[CAPTURE] Page.navigate done', 'tabId=', tabId,
+      'elapsed=', (record.setupTiming.pageNavigateEndAt - record.setupTiming.pageNavigateStartAt), 'ms');
   } catch (err) {
-    console.error('[CAPTURE] interstitial setup failed', Date.now(), 'tabId=', tabId,
+    console.error('[CAPTURE] interstitial setup failed', 'tabId=', tabId,
       'err=', err.message);
     await removeSessionAllowRule(tabId, record.captureId);
     finishWithError(tabId, record.captureId, 'interstitial setup failed: ' + err.message);
@@ -313,13 +313,14 @@ function startCaptureTimers(tabId, record) {
   record.maxTimer = setTimeout(() => {
     const r = captures.get(tabId);
     if (r && r.captureId === record.captureId && r.state === ST.CAPTURING) {
-      console.log('[CAPTURE] max timeout', Date.now(), 'tabId=', tabId,
+      console.warn('[CAPTURE] max timeout', 'tabId=', tabId,
         'captureId=', record.captureId);
       doReconcile(tabId, record.captureId);
     }
   }, MAX_CAPTURE_MS);
   notifyPopup(tabId);
-  console.log('[CAPTURE] capturing started', Date.now(), 'tabId=', tabId,
+  resetIdleTimer(tabId, record.captureId);
+  console.log('[CAPTURE] capturing started', 'tabId=', tabId,
     'captureId=', record.captureId);
 }
 
@@ -332,10 +333,6 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
 
   const record = captures.get(tabId);
 
-  console.log('[NAV] onCommitted', Date.now(), 'tabId=', tabId,
-    'url=', url.slice(0, 120),
-    'recordState=', record ? record.state : 'none');
-
   // ── State: USER_NAV_DETECTED → blank.html committed ──
   if (record && record.state === ST.USER_NAV_DETECTED && url.startsWith('chrome-extension://')) {
     transitionTo(record, ST.INTERSTITIAL_COMMITTED, 'onCommitted(blank.html)');
@@ -343,7 +340,7 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
     record.interstitialTimer = setTimeout(() => {
       const r = captures.get(tabId);
       if (r && r.captureId === record.captureId && r.state === ST.INTERSTITIAL_COMMITTED) {
-        console.error('[CAPTURE] interstitial timeout', Date.now(), 'tabId=', tabId);
+        console.error('[CAPTURE] interstitial timeout', 'tabId=', tabId);
         finishWithError(tabId, record.captureId, 'interstitial timeout');
       }
     }, INTERSTITIAL_TIMEOUT_MS);
@@ -367,31 +364,65 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
 // Tab closed
 // ============================================================================
 chrome.tabs.onRemoved.addListener((tabId) => {
-  console.log('[CAPTURE] onRemoved', Date.now(), 'tabId=', tabId);
+  console.log('[CAPTURE] onRemoved', 'tabId=', tabId);
   disposeRecord(tabId);
 });
 
 // ============================================================================
 // CDP event handling
 // ============================================================================
-async function handleCdpEvent(tabId, captureId, method, params) {
+async function handleCdpEvent(tabId, captureId, method, params, source) {
   const record = captures.get(tabId);
   if (!record || record.captureId !== captureId) return;
   if (record.state !== ST.READY && record.state !== ST.NAVIGATING_TARGET && record.state !== ST.CAPTURING) return;
 
   switch (method) {
+    case 'Target.attachedToTarget': {
+      const { targetInfo, sessionId } = params;
+      if (targetInfo.type === 'page') break;
+      console.log('[CDP] Target.attachedToTarget', Date.now(),
+        'targetId=', targetInfo.targetId,
+        'type=', targetInfo.type,
+        'sessionId=', sessionId,
+        'url=', (targetInfo.url || '').slice(0, 80));
+      record.childTargets.set(targetInfo.targetId, {
+        type: targetInfo.type,
+        url: targetInfo.url,
+        sessionId,
+      });
+      // Enable Network for child target
+      await chrome.debugger.sendCommand(
+        { tabId, sessionId },
+        'Network.enable'
+      );
+      break;
+    }
+
+    case 'Target.detachedFromTarget': {
+      const { targetId } = params;
+      console.log('[CDP] Target.detachedFromTarget', Date.now(), 'targetId=', targetId);
+      record.childTargets.delete(targetId);
+      break;
+    }
+
     case 'Network.requestWillBeSent': {
       const isDoc = params.type === 'Document' && params.frameId === 0;
       const isGateway = isGatewayUrl(params.request.url);
+      const sid = source?.sessionId || null;
+      const resourceKey = sid ? `${sid}:${params.requestId}` : params.requestId;
 
       if (isGateway) {
-        record.cdpRequests.set(params.requestId, {
+        const cdpReqNormKey = normalizeResourceKey(params.request.url, params.type);
+        record.cdpRequests.set(resourceKey, {
           url: params.request.url,
           method: params.request.method,
           type: params.type,
           status: null,
           mime: null,
           fromCache: false,
+          sessionId: sid,
+          cdpRequestId: params.requestId,
+          _normKey: cdpReqNormKey,
           requestWillBeSentTime: Date.now(),
           responseReceivedTime: null,
           loadingFinishedTime: null,
@@ -403,32 +434,22 @@ async function handleCdpEvent(tabId, captureId, method, params) {
           bodyFetchResult: null,
           bodyFetchError: null,
         });
-        console.log('[CDP_REQ] requestWillBeSent', Date.now(),
-          'requestId=', params.requestId,
-          'type=', params.type,
-          'url=', params.request.url.slice(0, 120));
 
         if (record.setupTiming.firstCdpRequestAt === null) {
           record.setupTiming.firstCdpRequestAt = Date.now();
-          console.log('[TIMING] first CDP requestWillBeSent', record.setupTiming.firstCdpRequestAt,
-            'requestId=', params.requestId,
-            'type=', params.type,
-            'url=', params.request.url.slice(0, 80));
         }
       }
-      if (isDoc && record.documentRequestId === null && isGatewayUrl(params.request.url)) {
-        record.documentRequestId = params.requestId;
-        console.log('[CDP] Document requestWillBeSent', Date.now(),
-          'tabId=', tabId, 'reqId=', params.requestId,
-          'url=', params.request.url.slice(0, 100));
+      if (isDoc && isGatewayUrl(params.request.url)) {
+        if (record.documentRequestId === null) {
+          record.documentRequestId = resourceKey;
+          console.log('[CDP] Document requestWillBeSent', 'tabId=', tabId,
+            'reqId=', resourceKey,
+            'url=', params.request.url.slice(0, 100));
+        }
+        record.docCaptured = true;
       }
 
       const isTarget = RESOURCE_TYPES_FOR_SILENCE.has(params.type);
-
-      console.log('[CDP] requestWillBeSent', Date.now(), 'tabId=', tabId,
-        'type=', params.type, 'isGateway=', isGateway,
-        'url=', params.request.url.slice(0, 100),
-        'active=', record.activeRequests);
 
       if (isGateway && isTarget) {
         record.activeRequests++;
@@ -438,7 +459,9 @@ async function handleCdpEvent(tabId, captureId, method, params) {
     }
 
     case 'Network.responseReceived': {
-      let req = record.cdpRequests.get(params.requestId);
+      const sid = source?.sessionId || null;
+      const resourceKey = sid ? `${sid}:${params.requestId}` : params.requestId;
+      let req = record.cdpRequests.get(resourceKey);
       if (req) {
         req.status = params.response.status;
         req.mime = params.response.mimeType;
@@ -449,6 +472,7 @@ async function handleCdpEvent(tabId, captureId, method, params) {
         req.fromServiceWorker = !!params.response.fromServiceWorker;
         req.encodedDataLength = params.response.encodedDataLength;
       } else if (isGatewayUrl(params.response.url)) {
+        const memCacheNormKey = normalizeResourceKey(params.response.url, params.type);
         req = {
           url: params.response.url,
           method: 'GET',
@@ -456,6 +480,9 @@ async function handleCdpEvent(tabId, captureId, method, params) {
           status: params.response.status,
           mime: params.response.mimeType,
           fromCache: !!(params.response.fromDiskCache || params.response.fromServiceWorker),
+          sessionId: sid,
+          cdpRequestId: params.requestId,
+          _normKey: memCacheNormKey,
           requestWillBeSentTime: null,
           responseReceivedTime: Date.now(),
           loadingFinishedTime: null,
@@ -467,65 +494,45 @@ async function handleCdpEvent(tabId, captureId, method, params) {
           bodyFetchResult: null,
           bodyFetchError: null,
         };
-        record.cdpRequests.set(params.requestId, req);
-        console.log('[CDP] responseReceived (requestWillBeSent SKIPPED, memory cache)', Date.now(),
-          'requestId=', params.requestId,
-          'type=', params.type,
-          'url=', params.response.url.slice(0, 80));
-      }
-      if (isGatewayUrl(params.response.url)) {
-        console.log('[CDP] responseReceived', Date.now(),
-          'type=', params.type, 'status=', params.response.status,
-          'mime=', params.response.mimeType,
-          'fromCache=', req?.fromCache,
-          'url=', params.response.url.slice(0, 80));
+        record.cdpRequests.set(resourceKey, req);
       }
       break;
     }
 
     case 'Network.requestServedFromCache': {
-      console.log('[CDP] requestServedFromCache', Date.now(),
-        'reqId=', params.requestId, 'url=', (record.cdpRequests.get(params.requestId)?.url || '').slice(0, 80));
-      const req = record.cdpRequests.get(params.requestId);
+      const sid = source?.sessionId || null;
+      const resourceKey = sid ? `${sid}:${params.requestId}` : params.requestId;
+      const req = record.cdpRequests.get(resourceKey);
       if (req) req.fromCache = true;
       break;
     }
 
     case 'Network.loadingFinished': {
-      const finReq = record.cdpRequests.get(params.requestId);
+      const sid = source?.sessionId || null;
+      const resourceKey = sid ? `${sid}:${params.requestId}` : params.requestId;
+      const finReq = record.cdpRequests.get(resourceKey);
       if (finReq && RESOURCE_TYPES_FOR_SILENCE.has(finReq.type) && isGatewayUrl(finReq.url)) {
         if (finReq.requestWillBeSentTime !== null) {
           record.activeRequests--;
         }
       }
       if (finReq) finReq.loadingFinishedTime = Date.now();
-      const rwsSkipped = finReq && finReq.requestWillBeSentTime === null;
-      console.log('[CDP] loadingFinished', Date.now(),
-        'type=', finReq?.type, 'url=', finReq?.url?.slice(0, 80),
-        rwsSkipped ? '(requestWillBeSent skipped, memory cache)' : '');
-      await fetchBody(tabId, captureId, params.requestId);
+      await fetchBody(tabId, captureId, resourceKey);
       checkCompletion(tabId, captureId);
       break;
     }
 
     case 'Network.loadingFailed': {
-      const failReq = record.cdpRequests.get(params.requestId);
+      const sid = source?.sessionId || null;
+      const resourceKey = sid ? `${sid}:${params.requestId}` : params.requestId;
+      const failReq = record.cdpRequests.get(resourceKey);
       if (failReq && RESOURCE_TYPES_FOR_SILENCE.has(failReq.type) && isGatewayUrl(failReq.url)) {
         record.activeRequests--;
       }
       if (failReq) failReq.loadingFailedTime = Date.now();
-      console.log('[CDP] loadingFailed', Date.now(), 'tabId=', tabId,
-        'reqId=', params.requestId, 'error=', params.errorText,
-        'active=', record.activeRequests);
+      console.warn('[CDP] loadingFailed', 'tabId=', tabId,
+        'reqId=', resourceKey, 'error=', params.errorText);
       checkCompletion(tabId, captureId);
-      break;
-    }
-
-    case 'Page.loadEventFired': {
-      console.log('[CDP] Page.loadEventFired', Date.now(), 'tabId=', tabId,
-        'captureId=', captureId, '(soft signal)',
-        'active=', record.activeRequests, 'docCaptured=', record.docCaptured,
-        'resourcesLen=', record.resources.length);
       break;
     }
   }
@@ -534,27 +541,30 @@ async function handleCdpEvent(tabId, captureId, method, params) {
 // ============================================================================
 // Fetch response body — with retry and failure classification
 // ============================================================================
-async function fetchBody(tabId, captureId, requestId) {
+async function fetchBody(tabId, captureId, resourceKey) {
   const record = captures.get(tabId);
   if (!record || record.captureId !== captureId) return;
-  if (record.state !== ST.CAPTURING) return;
-  if (record.processed.has(requestId)) return;
+  if (record.state !== ST.NAVIGATING_TARGET && record.state !== ST.CAPTURING) return;
+  if (record.processed.has(resourceKey)) return;
 
-  const req = record.cdpRequests.get(requestId);
+  const req = record.cdpRequests.get(resourceKey);
   if (!req) return;
   if (!isGatewayUrl(req.url)) return;
 
-  record.processed.add(requestId);
+  record.processed.add(resourceKey);
   record.pendingBodies++;
 
   const retryDelays = [100, 300];
+  const debuggee = req.sessionId
+    ? { tabId, sessionId: req.sessionId }
+    : { tabId };
 
   for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
     try {
       const { body, base64Encoded } = await chrome.debugger.sendCommand(
-        { tabId },
+        debuggee,
         'Network.getResponseBody',
-        { requestId }
+        { requestId: req.cdpRequestId }
       );
       const size = base64Encoded
         ? atob(body).length
@@ -580,27 +590,22 @@ async function fetchBody(tabId, captureId, requestId) {
         mime: req.mime,
         bodySuccess: true,
         fromCache: req.fromCache,
-        cdpRequestId: requestId,
+        cdpRequestId: resourceKey,
       });
 
       req.bodyFetchResult = 'success';
 
-      if (req.type === 'Document' && requestId === record.documentRequestId) {
+      if (req.type === 'Document') {
         record.docCaptured = true;
-        console.log('[CDP] getResponseBody OK (Document)', Date.now(),
+        console.log('[CDP] getResponseBody OK (Document)',
           'size=', size, 'url=', req.url.slice(0, 80));
-      } else {
-        console.log('[CDP] getResponseBody OK', Date.now(),
-          'type=', req.type, 'size=', size,
-          'attempt=', attempt + 1,
-          'url=', req.url.slice(0, 80));
       }
 
       record.pendingBodies--;
       return;
     } catch (e) {
       if (attempt < retryDelays.length) {
-        console.log('[CDP] getResponseBody retry', Date.now(),
+        console.warn('[CDP] getResponseBody retry',
           'type=', req.type, 'attempt=', attempt + 1,
           'delay=', retryDelays[attempt], 'ms',
           'url=', req.url.slice(0, 80));
@@ -628,13 +633,13 @@ async function fetchBody(tabId, captureId, requestId) {
           bodySuccess: false,
           bodyUnavailable: isBodyUnavailable,
           fromCache: req.fromCache,
-          cdpRequestId: requestId,
+          cdpRequestId: resourceKey,
         });
 
         req.bodyFetchResult = 'fail';
         req.bodyFetchError = e.message;
 
-        console.log('[CDP] getResponseBody FAIL (after retries)', Date.now(),
+        console.error('[CDP] getResponseBody FAIL',
           'type=', req.type, 'err=', e.message,
           'bodyUnavailable=', isBodyUnavailable,
           'fromCache=', req.fromCache,
@@ -669,8 +674,6 @@ function checkCompletion(tabId, captureId) {
 
   if (record.activeRequests === 0 && record.pendingBodies === 0) {
     if (!record.idleTimer) {
-      console.log('[CAPTURE] checkCompletion: all done, waiting for idle', Date.now(),
-        'tabId=', tabId, 'captureId=', captureId);
       resetIdleTimer(tabId, captureId);
     }
   }
@@ -686,20 +689,15 @@ function resetIdleTimer(tabId, captureId) {
     if (r.state !== ST.CAPTURING) return;
     r.idleTimer = null;
     if (r.activeRequests === 0 && r.pendingBodies === 0) {
-      console.log('[CAPTURE] idle complete → reconcile', Date.now(),
-        'tabId=', tabId, 'captureId=', captureId,
-        'resourcesLen=', r.resources.length);
+      console.log('[CAPTURE] idle complete → reconcile', 'tabId=', tabId,
+        'captureId=', captureId, 'resources=', r.resources.length);
       doReconcile(tabId, captureId);
-    } else {
-      console.log('[CAPTURE] idle timer: new requests, waiting more', Date.now(),
-        'tabId=', tabId, 'captureId=', captureId,
-        'active=', r.activeRequests, 'pendingBodies=', r.pendingBodies);
     }
   }, IDLE_MS);
 }
 
 // ============================================================================
-// Reconcile — webRequest vs CDP 对账
+// Reconcile — webRequest vs CDP
 // ============================================================================
 function doReconcile(tabId, captureId) {
   const record = captures.get(tabId);
@@ -719,7 +717,6 @@ function doReconcile(tabId, captureId) {
   }
 
   const captured = [];
-  const bodyMissing = [];
   const cdpMissed = [];
 
   let cdpReqSentCount = 0;
@@ -733,18 +730,24 @@ function doReconcile(tabId, captureId) {
 
   for (const wReq of wReqDeduped) {
     const normKey = wReq._normKey;
-    const cdpMatch = record.cdpResources.get(normKey);
+    let cdpMatch = record.cdpResources.get(normKey);
+
+    // Fuzzy match: webRequest and CDP use different type names
+    // (e.g. webRequest 'xmlhttprequest' vs CDP 'Fetch')
+    if (!cdpMatch) {
+      const baseUrl = normKey.split('|')[0];
+      for (const [resKey, resVal] of record.cdpResources) {
+        if (resKey.startsWith(baseUrl + '|')) {
+          cdpMatch = resVal;
+          break;
+        }
+      }
+    }
 
     if (!cdpMatch) {
       cdpMissed.push(wReq);
     } else if (cdpMatch.bodySuccess) {
       captured.push(wReq);
-    } else {
-      bodyMissing.push({
-        ...wReq,
-        bodyUnavailable: cdpMatch.bodyUnavailable,
-        fromCache: cdpMatch.fromCache,
-      });
     }
   }
 
@@ -754,175 +757,59 @@ function doReconcile(tabId, captureId) {
 
   for (const wReq of cdpMissed) {
     const normKey = wReq._normKey;
+    const baseUrl = normKey.split('|')[0];
     let cdpReq = null;
-    for (const [reqId, r] of record.cdpRequests) {
-      if (normalizeResourceKey(r.url, r.type) === normKey) {
+    for (const [, r] of record.cdpRequests) {
+      const rNormKey = r._normKey || normalizeResourceKey(r.url, r.type);
+      if (rNormKey === normKey || rNormKey.startsWith(baseUrl + '|')) {
         cdpReq = r;
         break;
       }
     }
-    const cdpRes = record.cdpResources.get(normKey);
     const reqTime = wReq.timeStamp;
     const netEnabled = record.cdpReadyAt || 0;
 
     if (cdpReq) {
-      if (cdpRes && cdpRes.bodySuccess) {
-        missingC.push({ ...wReq, _category: 'C', _cdpReq: cdpReq, _cdpRes: cdpRes, _bug: true });
-      } else {
-        missingC.push({ ...wReq, _category: 'C', _cdpReq: cdpReq, _cdpRes: cdpRes });
-      }
+      missingC.push(wReq);
     } else if (reqTime < netEnabled) {
-      missingA.push({ ...wReq, _category: 'A' });
+      missingA.push(wReq);
     } else {
-      missingB.push({ ...wReq, _category: 'B' });
+      missingB.push(wReq);
     }
   }
 
   record.missingResources = missingB;
 
-  const realMissing = missingB.length;
-  record.captureQuality = realMissing > 0 ? 'partial' : 'complete';
+  record.captureQuality = missingB.length > 0 ? 'partial' : 'complete';
   if (!record.docCaptured) {
     record.captureQuality = 'partial';
     if (!record.error) record.error = 'document not captured';
+    console.warn('[CAPTURE] reconcile: docCaptured=false, setting quality=partial');
   }
 
-  // =========================================================================
-  // CAPTURE SUMMARY
-  // =========================================================================
-  console.log('[CAPTURE] ╔══════════════════════════════════════════════');
-  console.log('[CAPTURE] ║  CAPTURE SUMMARY');
-  console.log('[CAPTURE] ╠══════════════════════════════════════════════');
-  console.log('[CAPTURE] ║  captureId :', captureId);
-  console.log('[CAPTURE] ║  gatewayId :', record.gatewayId);
-  console.log('[CAPTURE] ║  duration  :', Date.now() - record.startedAt, 'ms');
-  console.log('[CAPTURE] ║  quality   :', record.captureQuality);
-  console.log('[CAPTURE] ╠══════════════════════════════════════════════');
-  console.log('[CAPTURE] ║  Gateway requests (webRequest) :', wReqLog.length,
-    '(deduped:', wReqDeduped.length, ')');
-  console.log('[CAPTURE] ║  CDP requestWillBeSent :', cdpReqSentCount);
-  console.log('[CAPTURE] ║  CDP responseReceived  :', cdpRespRecvCount);
-  console.log('[CAPTURE] ║  CDP loadingFinished   :', cdpLoadFinishCount);
-  console.log('[CAPTURE] ║  CDP body success      :', captured.length);
-  console.log('[CAPTURE] ║  CDP body failed       :', record.failedBodies.length);
-  console.log('[CAPTURE] ║  CDP resources (Map)   :', record.cdpResources.size);
-
-  // Phase A/C merge stats
-  const phaseA = wReqLog.filter(r => r.phase === 'A');
-  const phaseC = wReqLog.filter(r => r.phase === 'C');
-  let cdpRwsSkipped = 0;
-  let cdpMemCacheBodies = 0;
-  let cdpMemCacheBodiesFailed = 0;
-  for (const req of record.cdpRequests.values()) {
-    if (req.requestWillBeSentTime === null) {
-      cdpRwsSkipped++;
-      if (req.bodyFetchResult === 'success') cdpMemCacheBodies++;
-      if (req.bodyFetchResult === 'fail') cdpMemCacheBodiesFailed++;
-    }
-  }
-  console.log('[CAPTURE] ╠══════════════════════════════════════════════');
-  console.log('[CAPTURE] ║  PHASE A/C MERGE');
-  console.log('[CAPTURE] ╠══════════════════════════════════════════════');
-  console.log('[CAPTURE] ║  Phase A webRequest (before CDP)  :', phaseA.length);
-  console.log('[CAPTURE] ║  Phase C webRequest (after CDP)   :', phaseC.length);
-  console.log('[CAPTURE] ║  Merged (deduped)                  :', wReqDeduped.length);
-  console.log('[CAPTURE] ║  CDP normal (requestWillBeSent)    :', cdpReqSentCount);
-  console.log('[CAPTURE] ║  CDP memory cache (rws skipped)    :', cdpRwsSkipped);
-  console.log('[CAPTURE] ║    → body captured                 :', cdpMemCacheBodies);
-  console.log('[CAPTURE] ║    → body failed                   :', cdpMemCacheBodiesFailed);
-  console.log('[CAPTURE] ║  CDP total requests                :', record.cdpRequests.size);
-  console.log('[CAPTURE] ║  Body captured (resources[])        :', record.resources.length);
-  const allResWithBody = new Set(record.resources.map(r => normalizeResourceKey(r.url, r.type)));
-  const missingBody = wReqDeduped.filter(w => !allResWithBody.has(w._normKey));
-  console.log('[CAPTURE] ║  Merged resources without body     :', missingBody.length);
-  console.log('[CAPTURE] ╠══════════════════════════════════════════════');
-
-  // Setup timeline
+  // ---------------------------------------------------------------------------
+  // Reconcile summary
+  // ---------------------------------------------------------------------------
   const st = record.setupTiming;
-  console.log('[CAPTURE] ║  SETUP TIMELINE');
-  console.log('[CAPTURE] ╠══════════════════════════════════════════════');
-  if (st.attachStartAt) {
-    console.log('[CAPTURE] ║  [1] debugger.attach    :', st.attachStartAt,
-      '→', st.attachEndAt, '(elapsed:', (st.attachEndAt - st.attachStartAt), 'ms)');
-  }
-  if (st.networkEnableStartAt) {
-    console.log('[CAPTURE] ║  [2] Network.enable     :', st.networkEnableStartAt,
-      '→', st.networkEnableEndAt, '(elapsed:', (st.networkEnableEndAt - st.networkEnableStartAt), 'ms)');
-  }
-  if (st.pageEnableStartAt) {
-    console.log('[CAPTURE] ║  [3] Page.enable        :', st.pageEnableStartAt,
-      '→', st.pageEnableEndAt, '(elapsed:', (st.pageEnableEndAt - st.pageEnableStartAt), 'ms)');
-  }
-  if (st.pageNavigateStartAt) {
-    console.log('[CAPTURE] ║  [4] Page.navigate      :', st.pageNavigateStartAt,
-      '→', st.pageNavigateEndAt, '(elapsed:', (st.pageNavigateEndAt - st.pageNavigateStartAt), 'ms)');
-  }
-  if (st.firstCdpRequestAt) {
-    console.log('[CAPTURE] ║  [5] first CDP request  :', st.firstCdpRequestAt);
-  }
-  if (st.pageNavigateEndAt && st.firstCdpRequestAt) {
-    const delta = st.firstCdpRequestAt - st.pageNavigateEndAt;
-    console.log('[CAPTURE] ║  ORDERING: Page.navigate.end → first CDP req =', delta, 'ms',
-      delta >= 0 ? '(OK)' : '(UNEXPECTED)');
-  }
+  console.log('[CAPTURE] reconcile', captureId,
+    'gatewayId=', record.gatewayId,
+    'quality=', record.captureQuality,
+    'duration=', Date.now() - record.startedAt, 'ms',
+    'webRequest=', wReqLog.length, '(deduped:', wReqDeduped.length, ')',
+    'CDP rws=', cdpReqSentCount, 'resp=', cdpRespRecvCount, 'finish=', cdpLoadFinishCount,
+    'body ok=', captured.length, 'fail=', record.failedBodies.length,
+    'missing A=', missingA.length, 'B=', missingB.length, 'C=', missingC.length,
+    'setup attach=', (st.attachEndAt - st.attachStartAt), 'ms',
+    'network=', (st.networkEnableEndAt - st.networkEnableStartAt), 'ms',
+    'navigate=', (st.pageNavigateEndAt - st.pageNavigateStartAt), 'ms');
 
-  // Category A items
-  if (missingA.length > 0) {
-    console.log('[CAPTURE] ║  CATEGORY A (', missingA.length, '): reqTime < cdpReadyAt');
-    console.log('[CAPTURE] ║    cdpReadyAt:', record.cdpReadyAt);
-    for (const a of missingA.slice(0, 5)) {
-      console.log('[CAPTURE] ║    [A] reqTime=', a.timeStamp,
-        'gap=', (record.cdpReadyAt || 0) - a.timeStamp, 'ms',
-        'type=', a.type, 'url=', a.url.slice(0, 80));
+  if (missingB.length > 0) {
+    console.warn('[CAPTURE] reconcile: CDP missed', missingB.length, 'resources');
+    for (const m of missingB.slice(0, 5)) {
+      console.warn('[CAPTURE]   missed:', m.type, m.url.slice(0, 120));
     }
+    if (missingB.length > 5) console.warn('[CAPTURE]   ... and', missingB.length - 5, 'more');
   }
-  console.log('[CAPTURE] ╠══════════════════════════════════════════════');
-
-  // Missing breakdown
-  if (cdpMissed.length > 0) {
-    console.log('[CAPTURE] ║  MISSING BREAKDOWN (', cdpMissed.length, 'items)');
-    console.log('[CAPTURE] ║    A: attach too late :', missingA.length);
-    console.log('[CAPTURE] ║    B: CDP omission     :', missingB.length);
-    console.log('[CAPTURE] ║    C: body fetch issue  :', missingC.length);
-    console.log('[CAPTURE] ║    captureQuality (B)   :', record.captureQuality);
-    console.log('[CAPTURE] ╠══════════════════════════════════════════════');
-    console.log('[CAPTURE] ║  MISSING_ANALYSIS');
-    for (const item of cdpMissed) {
-      const normKey = item._normKey;
-      let cdpReq = null;
-      let cdpReqId = null;
-      for (const [reqId, r] of record.cdpRequests) {
-        if (normalizeResourceKey(r.url, r.type) === normKey) {
-          cdpReq = r;
-          cdpReqId = reqId;
-          break;
-        }
-      }
-      const cdpRes = record.cdpResources.get(normKey);
-      const reqTime = item.timeStamp;
-      const netEnabled = record.cdpReadyAt || 0;
-      const tooEarly = reqTime < netEnabled;
-
-      console.log('[CAPTURE] ║  ─────────────────────────────────');
-      console.log('[CAPTURE] ║  [MISSING] category=', item._category || '?');
-      console.log('[CAPTURE] ║    url               :', item.url.slice(0, 120));
-      console.log('[CAPTURE] ║    type              :', item.type);
-      console.log('[CAPTURE] ║    webRequestTime    :', reqTime);
-      console.log('[CAPTURE] ║    networkEnabledTime:', netEnabled);
-      console.log('[CAPTURE] ║    reqTime < netEnabled :', tooEarly);
-      console.log('[CAPTURE] ║    cdpRequestSeen    :', cdpReq ? true : false);
-      console.log('[CAPTURE] ║    cdpRequestId      :', cdpReqId || 'N/A');
-      if (cdpReq && cdpReq.responseReceivedTime) {
-        console.log('[CAPTURE] ║    fromDiskCache     :', cdpReq.fromDiskCache);
-        console.log('[CAPTURE] ║    fromPrefetchCache  :', cdpReq.fromPrefetchCache);
-        console.log('[CAPTURE] ║    fromServiceWorker  :', cdpReq.fromServiceWorker);
-      }
-      console.log('[CAPTURE] ║    bodyFetchAttempted:', cdpRes ? true : false);
-      console.log('[CAPTURE] ║    bodyFetchResult   :', cdpRes ? (cdpRes.bodySuccess ? 'success' : 'fail') : 'N/A');
-    }
-  }
-
-  console.log('[CAPTURE] ╚══════════════════════════════════════════════');
 
   webRequestLog.delete(captureId);
   completeCapture(tabId, captureId);
@@ -931,14 +818,14 @@ function doReconcile(tabId, captureId) {
 // ============================================================================
 // Finalize capture
 // ============================================================================
-function completeCapture(tabId, captureId) {
+async function completeCapture(tabId, captureId) {
   const record = captures.get(tabId);
   if (!record || record.captureId !== captureId) return;
 
   transitionTo(record, ST.COMPLETED, 'completeCapture');
   record.durationMs = Date.now() - record.startedAt;
 
-  console.log('[CAPTURE] completeCapture', Date.now(), 'tabId=', tabId,
+  console.log('[CAPTURE] completeCapture', 'tabId=', tabId,
     'captureId=', captureId,
     'gatewayId=', record.gatewayId,
     'captureQuality=', record.captureQuality,
@@ -947,7 +834,7 @@ function completeCapture(tabId, captureId) {
     'missing=', record.missingResources.length,
     'durationMs=', record.durationMs);
 
-  detachDebugger(tabId, captureId);
+  await detachDebugger(tabId, captureId);
   notifyPopup(tabId);
 }
 
@@ -967,14 +854,14 @@ async function detachDebugger(tabId, captureId) {
     record.onEvent = null;
   }
 
-  console.log('[CAPTURE] detachDebugger', Date.now(), 'tabId=', tabId);
+  console.log('[CAPTURE] detachDebugger', 'tabId=', tabId);
   await chrome.debugger.detach({ tabId }).catch(() => {});
 }
 
 async function abortCapture(tabId, reason) {
   const record = captures.get(tabId);
   if (!record || !ACTIVE_STATES.has(record.state)) return;
-  console.log('[CAPTURE] abortCapture', Date.now(), 'tabId=', tabId,
+  console.warn('[CAPTURE] abortCapture', 'tabId=', tabId,
     'reason=', reason, 'captureId=', record.captureId);
   transitionTo(record, ST.ERROR, 'abortCapture: ' + reason);
   record.error = reason;
@@ -988,7 +875,7 @@ async function abortCapture(tabId, reason) {
 async function disposeRecord(tabId) {
   const record = captures.get(tabId);
   if (!record) return;
-  console.log('[CAPTURE] disposeRecord', Date.now(), 'tabId=', tabId,
+  console.log('[CAPTURE] disposeRecord', 'tabId=', tabId,
     'captureId=', record.captureId);
   webRequestLog.delete(record.captureId);
   await removeSessionAllowRule(tabId, record.captureId);
@@ -999,7 +886,7 @@ async function disposeRecord(tabId) {
 async function finishWithError(tabId, captureId, error) {
   const record = captures.get(tabId);
   if (!record || record.captureId !== captureId) return;
-  console.log('[CAPTURE] finishWithError', Date.now(), 'tabId=', tabId,
+  console.error('[CAPTURE] finishWithError', 'tabId=', tabId,
     'err=', error);
   transitionTo(record, ST.ERROR, 'finishWithError: ' + error);
   record.error = error;
@@ -1013,7 +900,7 @@ async function finishWithError(tabId, captureId, error) {
 // Debugger detached externally
 chrome.debugger.onDetach.addListener(({ tabId }) => {
   const record = captures.get(tabId);
-  if (record && record.state === ST.CAPTURING) {
+  if (record && ACTIVE_STATES.has(record.state)) {
     finishWithError(tabId, record.captureId, 'debugger detached');
   }
 });
@@ -1029,13 +916,13 @@ function notifyPopup(tabId) {
 // Message handling: interstitialReady + popup ↔ background
 // ============================================================================
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  // interstitialReady — blank.html 通知（无需 sendResponse）
+  // interstitialReady — blank.html notification (no sendResponse needed)
   if (msg.action === 'interstitialReady') {
     handleInterstitialReady(sender.tab.id, msg.targetUrl);
     return false;
   }
 
-  // popup 消息
+  // Popup messages
   (async () => {
     const tabId = msg.tabId ?? (await getActiveTabId());
     const record = tabId != null ? captures.get(tabId) : null;

@@ -1,14 +1,14 @@
 // =============================================================================
-// gateway-matcher.js — 共享匹配层
+// gateway-matcher.js — shared matching layer
 // =============================================================================
-// webRequest 和 CDP 两边共用同一套匹配逻辑。
-// 唯一依赖：gateway-config.js
+// webRequest and CDP share the same matching logic.
+// Sole dependency: gateway-config.js
 // =============================================================================
 
 import { GATEWAY_CONFIG } from './gateway-config.js';
 
 /**
- * 根据 URL 匹配 gateway 配置。
+ * Match a URL against gateway config.
  */
 export function matchGateway(url) {
   try {
@@ -24,21 +24,21 @@ export function matchGateway(url) {
       }
     }
   } catch {
-    // URL parse 失败
+    // URL parse failure
   }
   return null;
 }
 
 /**
- * 判断 URL 是否属于任意 gateway。
+ * Check if a URL belongs to any gateway.
  */
 export function isGatewayUrl(url) {
   return matchGateway(url) !== null;
 }
 
 /**
- * 生成 webRequest listener 的 urls filter 参数。
- * 从 GATEWAY_CONFIG 自动推导，无需手动维护。
+ * Generate url filter patterns for webRequest listener.
+ * Derived automatically from GATEWAY_CONFIG.
  */
 export function getWebRequestUrlPatterns() {
   const patterns = [];

@@ -1,15 +1,15 @@
 // =============================================================================
-// dnr-manager.js — DNR 永久规则 + session allow 管理
+// dnr-manager.js — DNR permanent rules + session allow management
 // =============================================================================
-// 设计：
-//   1. initPermanentRules() — 永久 redirect 规则，重定向 gateway main_frame
-//      到 chrome-extension://<id>/blank.html#<url>
-//      规则在 service worker 每次启动时重新添加（同 ID 替换），持久化存储。
-//   2. addSessionAllowRule(tabId) — 高优先级 session allow 规则，
-//      在 Page.navigate 前添加，避免第二次导航被 DNR 再次拦截。
-//   3. removeSessionAllowRule(tabId) — 清理 session allow 规则。
+// Design:
+//   1. initPermanentRules() — permanent redirect rules, send gateway main_frame
+//      to chrome-extension://<id>/blank.html#<url>
+//      Rules re-added on every service worker start (same ID replaces), persisted.
+//   2. addSessionAllowRule(tabId) — high-priority session allow rule,
+//      added before Page.navigate to prevent second navigation from being intercepted.
+//   3. removeSessionAllowRule(tabId) — cleanup session allow rule.
 //
-// 禁止: enableDnrRuleset / disableDnrRuleset 的开关模式。
+// Forbidden: enableDnrRuleset / disableDnrRuleset toggle pattern.
 // =============================================================================
 
 import { GATEWAY_CONFIG } from './gateway-config.js';
@@ -63,12 +63,12 @@ const PERMANENT_RULES = buildPermanentRules();
 const PERMANENT_RULE_IDS = PERMANENT_RULES.map(r => r.id);
 
 /**
- * 初始化永久 DNR 规则。每次 service worker 启动时调用。
- * 动态规则持久化在浏览器进程，同 ID 替换保证幂等。
+ * Initialize permanent DNR rules. Called on every service worker start.
+ * Dynamic rules persist in browser process; same-ID replacement ensures idempotency.
  */
 export async function initPermanentRules() {
   try {
-    // 清理可能残留的 session allow rule（上次异常退出）
+    // Clean up leftover session allow rule from previous abnormal exit
     await chrome.declarativeNetRequest.updateSessionRules({
       removeRuleIds: [SESSION_ALLOW_RULE_ID],
     });
@@ -83,8 +83,8 @@ export async function initPermanentRules() {
 }
 
 /**
- * 为当前 tab 添加 session allow rule，绕过 DNR redirect。
- * 在 Page.navigate(targetUrl) 前调用。
+ * Add session allow rule for the current tab to bypass DNR redirect.
+ * Called before Page.navigate(targetUrl).
  */
 export async function addSessionAllowRule(tabId, captureId) {
   // Build condition: match all gateway hosts, only this tab, only main_frame
@@ -118,8 +118,8 @@ export async function addSessionAllowRule(tabId, captureId) {
 }
 
 /**
- * 移除 session allow rule。
- * 在 gateway URL committed 后或 abort/error 时调用。
+ * Remove session allow rule.
+ * Called after gateway URL committed or on abort/error.
  */
 export async function removeSessionAllowRule(tabId, captureId) {
   try {

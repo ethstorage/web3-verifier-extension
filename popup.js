@@ -32,7 +32,6 @@ document.addEventListener('DOMContentLoaded', () => {
   // Tab switch → re-read newly active tab data
   chrome.tabs.onActivated.addListener((activeInfo) => {
     if (activeInfo.tabId !== activeTabId) {
-      console.log('[POPUP] tab activated', activeInfo.tabId);
       refreshActiveTab();
     }
   });
@@ -75,9 +74,7 @@ async function refreshState() {
       return;
     }
     const s = res.state;
-    activeCaptureId = s.captureId || null;  // record current captureId to prevent stale responses
-    console.log('[POPUP] refreshState', 'state=', s.state, 'captureId=', s.captureId,
-      'captured=', s.counts?.captured, 'activeCaptureId=', activeCaptureId);
+    activeCaptureId = s.captureId || null;
     updateStatus(s);
 
     if (s.state === 'user_nav_detected' || s.state === 'interstitial_committed' ||
@@ -174,16 +171,12 @@ async function loadResults() {
   const res = await chrome.runtime.sendMessage({ action: 'getResults', tabId: activeTabId });
   // Prevent stale response contamination: verify captureId
   if (res && res.captureId && activeCaptureId && res.captureId !== activeCaptureId) {
-    console.log('[POPUP] stale results ignored', 'resCaptureId=', res.captureId, 'activeCaptureId=', activeCaptureId);
     return;
   }
   allResources = (res && res.resources) || [];
   missedResources = (res && res.missedResources) || [];
   failedBodies = (res && res.failedBodies) || [];
   const summary = (res && res.summary) || { total: 0, totalSize: 0, missed: 0, failedBodies: 0 };
-  console.log('[POPUP] loadResults', 'total=', summary.total, 'missed=', summary.missed,
-    'failedBodies=', summary.failedBodies,
-    'byType=', JSON.stringify(summary.byType), 'captureId=', res?.captureId);
 
   $('sumTotal').textContent = summary.total;
   $('sumSize').textContent = formatBytes(summary.totalSize);
