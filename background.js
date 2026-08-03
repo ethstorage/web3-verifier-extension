@@ -2,39 +2,40 @@
 // background.js — 状态机驱动的 gateway 资源捕获
 // =============================================================================
 // 架构：
-//   1. DNR 动态规则同步重定向 gateway main_frame → about:blank
-//   2. about:blank 上 attach CDP + 注册 listener + 禁用 DNR
-//   3. Page.navigate(targetUrl) → CDP 从导航起点捕获所有资源
-//   4. 网关 URL committed 后恢复 DNR 规则
-//   5. webRequest 作为独立审计日志
+//   1. DNR 永久规则重定向 gateway main_frame → chrome-extension://<id>/blank.html#<url>
+//   2. blank.html 加载后通知 background (interstitialReady)
+//   3. background attach CDP + 注册 listener + 添加 session allow rule
+//   4. Page.navigate(targetUrl) → session allow rule 绕过 DNR
+//   5. 网关 URL committed 后移除 session allow rule，开始捕获
+//   6. webRequest 作为独立审计日志
 //
 // 状态机：
-//   USER_NAV_DETECTED → BLANK_COMMITTED → NAVIGATING_TARGET → CAPTURING → COMPLETED
-//                                                                         ↓
-//                                                                       ERROR
+//   USER_NAV_DETECTED → INTERSTITIAL_COMMITTED → CDP_ATTACHING → READY
+//                                                                    ↓
+//                                                             NAVIGATING_TARGET
+//                                                                    ↓
+//                                                                CAPTURING
+//                                                                    ↓
+//                                                               COMPLETED
+//                                                               ERROR
 // =============================================================================
 
 import { matchGateway, isGatewayUrl, getWebRequestUrlPatterns } from './gateway-matcher.js';
-import { enableDnrRuleset, disableDnrRuleset } from './dnr-manager.js';
+import { initPermanentRules, addSessionAllowRule, removeSessionAllowRule } from './dnr-manager.js';
 
 // ============================================================================
-// DNR initialization — must run before any navigation is processed
+// DNR initialization — permanent rules, idempotent on every SW start
 // ============================================================================
-// onInstalled: fires on extension install/update, ensures rules persist
-chrome.runtime.onInstalled.addListener(() => {
-  enableDnrRuleset();
-});
-// Module top-level: fires on every service worker start, ensures rules are
-// present even after browser restart (dynamic rules persist, but this is a
-// safe no-op in that case — addRules replaces duplicates by ID).
-enableDnrRuleset();
+initPermanentRules();
 
 // ============================================================================
 // State constants
 // ============================================================================
 const ST = {
   USER_NAV_DETECTED: 'user_nav_detected',
-  BLANK_COMMITTED: 'blank_committed',
+  INTERSTITIAL_COMMITTED: 'interstitial_committed',
+  CDP_ATTACHING: 'cdp_attaching',
+  READY: 'ready',
   NAVIGATING_TARGET: 'navigating_target',
   CAPTURING: 'capturing',
   COMPLETED: 'completed',
@@ -43,12 +44,14 @@ const ST = {
 
 // Non-terminal states: capture session is active
 const ACTIVE_STATES = new Set([
-  ST.USER_NAV_DETECTED, ST.BLANK_COMMITTED,
+  ST.USER_NAV_DETECTED, ST.INTERSTITIAL_COMMITTED,
+  ST.CDP_ATTACHING, ST.READY,
   ST.NAVIGATING_TARGET, ST.CAPTURING,
 ]);
 
 const MAX_CAPTURE_MS = 30000;
 const IDLE_MS = 3500;
+const INTERSTITIAL_TIMEOUT_MS = 5000;
 
 const RESOURCE_TYPES_FOR_SILENCE = new Set([
   'Document', 'Script', 'Stylesheet', 'Image', 'Font',
@@ -71,7 +74,7 @@ function transitionTo(record, newState, event) {
     oldState, '→', newState,
     'event=', event,
     'url=', (record.url || '').slice(0, 80) || '(none)',
-    'frameId=', record.tabId);
+    'tabId=', record.tabId);
 }
 
 // ============================================================================
@@ -129,60 +132,42 @@ class CaptureRecord {
     // Completion timers
     this.idleTimer = null;
     this.maxTimer = null;
+    this.interstitialTimer = null;
   }
 }
 
 // ============================================================================
 // onBeforeNavigate — detect user gateway navigation
 // ============================================================================
-// DNR 重定向到 about:blank 后，此事件收到原始 URL。创建 capture session。
+// DNR 重定向到 blank.html 后，此事件收到原始 gateway URL。创建 capture session。
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   if (details.frameId !== 0) return;
   const { tabId, url } = details;
 
   console.log('[NAV] onBeforeNavigate', Date.now(), 'tabId=', tabId, 'url=', url.slice(0, 120));
 
+  // Ignore extension pages (blank.html interstitial)
+  if (url.startsWith('chrome-extension://')) return;
+
   const existing = captures.get(tabId);
 
-  // Distinguish internal vs. external navigation by state + targetUrl
+  // Internal navigation: Page.navigate to targetUrl
   if (existing) {
-    // State: NAVIGATING_TARGET — Page.navigate(targetUrl) in progress
-    if (existing.state === ST.NAVIGATING_TARGET) {
-      if (url === existing.targetUrl) {
-        console.log('[NAV] onBeforeNavigate: internal Page.navigate, ignoring (state=', existing.state, ')');
-        return;
-      }
-      // User navigated away during internal navigation → abort
-      console.log('[NAV] onBeforeNavigate: user navigated away during internal nav, aborting');
-      abortCapture(tabId, 'user navigated away during internal navigation');
+    if (existing.state === ST.NAVIGATING_TARGET && url === existing.targetUrl) {
+      console.log('[NAV] onBeforeNavigate: internal Page.navigate, ignoring');
       return;
     }
-    // State: BLANK_COMMITTED — CDP setup in progress on about:blank
-    if (existing.state === ST.BLANK_COMMITTED) {
-      if (url === existing.targetUrl || isGatewayUrl(url)) {
-        // DNR redirect to blank just happened, this is the original URL event
-        console.log('[NAV] onBeforeNavigate: setup phase, ignoring (state=', existing.state, ')');
-        return;
-      }
-      // User navigated away during setup → abort
-      console.log('[NAV] onBeforeNavigate: user navigated away during setup, aborting');
-      abortCapture(tabId, 'user navigated away during setup');
-      return;
-    }
-  }
-
-  // about:blank — ignore (it's already handled by onCommitted)
-  if (url === 'about:blank') return;
-
-  // Non-gateway → abort active capture
-  if (!isGatewayUrl(url)) {
-    if (existing && ACTIVE_STATES.has(existing.state)) {
+    // User navigated away during active capture
+    if (ACTIVE_STATES.has(existing.state) && !isGatewayUrl(url)) {
       abortCapture(tabId, 'navigated away');
+      return;
     }
-    return;
   }
 
-  // Gateway URL: new user navigation
+  // Non-gateway → ignore
+  if (!isGatewayUrl(url)) return;
+
+  // New gateway navigation
   if (existing) await disposeRecord(tabId);
   console.log('[CAPTURE] user navigation detected', Date.now(), 'tabId=', tabId,
     'url=', url.slice(0, 120));
@@ -252,9 +237,6 @@ async function setupCdp(tabId, record) {
   console.log('[TIMING] Network.enable END', record.setupTiming.networkEnableEndAt,
     'elapsed=', record.setupTiming.networkEnableEndAt - record.setupTiming.networkEnableStartAt, 'ms');
 
-  await chrome.debugger.sendCommand({ tabId }, 'Network.setCacheDisabled', { cacheDisabled: true });
-  console.log('[CDP] Network.setCacheDisabled(true)', Date.now(), 'tabId=', tabId);
-
   record.setupTiming.pageEnableStartAt = Date.now();
   console.log('[TIMING] Page.enable START', record.setupTiming.pageEnableStartAt, 'tabId=', tabId);
   await chrome.debugger.sendCommand({ tabId }, 'Page.enable');
@@ -273,6 +255,57 @@ async function setupCdp(tabId, record) {
   chrome.debugger.onEvent.addListener(record.onEvent);
   console.log('[CAPTURE] CDP listener registered', Date.now(), 'tabId=', tabId,
     'captureId=', record.captureId);
+}
+
+// ============================================================================
+// handleInterstitialReady — blank.html 通知 background
+// ============================================================================
+async function handleInterstitialReady(tabId, targetUrl) {
+  const record = captures.get(tabId);
+  if (!record) {
+    console.warn('[CAPTURE] interstitialReady: no record for tabId=', tabId);
+    return;
+  }
+  // Accept USER_NAV_DETECTED (onCommitted may not fire for chrome-extension:// URLs)
+  // or INTERSTITIAL_COMMITTED (onCommitted did fire)
+  if (record.state !== ST.USER_NAV_DETECTED && record.state !== ST.INTERSTITIAL_COMMITTED) {
+    console.warn('[CAPTURE] interstitialReady: unexpected state=', record.state, 'tabId=', tabId);
+    return;
+  }
+
+  console.log('[CAPTURE] interstitialReady received', Date.now(), 'tabId=', tabId,
+    'captureId=', record.captureId, 'prevState=', record.state,
+    'targetUrl=', targetUrl.slice(0, 120));
+
+  // Clear interstitial timeout (may not exist if onCommitted didn't fire)
+  if (record.interstitialTimer) {
+    clearTimeout(record.interstitialTimer);
+    record.interstitialTimer = null;
+  }
+
+  transitionTo(record, ST.CDP_ATTACHING, 'interstitialReady');
+
+  try {
+    await setupCdp(tabId, record);
+    transitionTo(record, ST.READY, 'cdp setup complete');
+
+    // Add session allow rule to bypass DNR on next navigation
+    await addSessionAllowRule(tabId, record.captureId);
+
+    transitionTo(record, ST.NAVIGATING_TARGET, 'Page.navigate');
+    record.setupTiming.pageNavigateStartAt = Date.now();
+    console.log('[TIMING] Page.navigate START', record.setupTiming.pageNavigateStartAt,
+      'tabId=', tabId, 'url=', targetUrl.slice(0, 120));
+    await chrome.debugger.sendCommand({ tabId }, 'Page.navigate', { url: targetUrl });
+    record.setupTiming.pageNavigateEndAt = Date.now();
+    console.log('[TIMING] Page.navigate END', record.setupTiming.pageNavigateEndAt,
+      'elapsed=', record.setupTiming.pageNavigateEndAt - record.setupTiming.pageNavigateStartAt, 'ms');
+  } catch (err) {
+    console.error('[CAPTURE] interstitial setup failed', Date.now(), 'tabId=', tabId,
+      'err=', err.message);
+    await removeSessionAllowRule(tabId, record.captureId);
+    finishWithError(tabId, record.captureId, 'interstitial setup failed: ' + err.message);
+  }
 }
 
 function startCaptureTimers(tabId, record) {
@@ -303,97 +336,31 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
     'url=', url.slice(0, 120),
     'recordState=', record ? record.state : 'none');
 
-  // ── State: USER_NAV_DETECTED → about:blank committed ──
-  if (record && record.state === ST.USER_NAV_DETECTED && url === 'about:blank') {
-    transitionTo(record, ST.BLANK_COMMITTED, 'onCommitted(about:blank)');
-    const t0 = Date.now();
-
-    try {
-      await setupCdp(tabId, record);
-
-      await disableDnrRuleset();
-
-      transitionTo(record, ST.NAVIGATING_TARGET, 'Page.navigate');
-      record.setupTiming.pageNavigateStartAt = Date.now();
-      console.log('[TIMING] Page.navigate START', record.setupTiming.pageNavigateStartAt,
-        'tabId=', tabId, 'url=', record.targetUrl.slice(0, 120));
-      await chrome.debugger.sendCommand({ tabId }, 'Page.navigate', {
-        url: record.targetUrl,
-      });
-      record.setupTiming.pageNavigateEndAt = Date.now();
-      console.log('[TIMING] Page.navigate END', record.setupTiming.pageNavigateEndAt,
-        'elapsed=', record.setupTiming.pageNavigateEndAt - record.setupTiming.pageNavigateStartAt, 'ms');
-
-      console.log('[TIMING] setup complete, total=', Date.now() - t0, 'ms',
-        'tabId=', tabId, 'captureId=', record.captureId);
-    } catch (err) {
-      console.error('[CAPTURE] blank setup failed', Date.now(), 'tabId=', tabId,
-        'err=', err.message);
-      finishWithError(tabId, record.captureId, 'blank setup failed: ' + err.message);
-    }
+  // ── State: USER_NAV_DETECTED → blank.html committed ──
+  if (record && record.state === ST.USER_NAV_DETECTED && url.startsWith('chrome-extension://')) {
+    transitionTo(record, ST.INTERSTITIAL_COMMITTED, 'onCommitted(blank.html)');
+    // Safety timeout: if interstitialReady not received, abort
+    record.interstitialTimer = setTimeout(() => {
+      const r = captures.get(tabId);
+      if (r && r.captureId === record.captureId && r.state === ST.INTERSTITIAL_COMMITTED) {
+        console.error('[CAPTURE] interstitial timeout', Date.now(), 'tabId=', tabId);
+        finishWithError(tabId, record.captureId, 'interstitial timeout');
+      }
+    }, INTERSTITIAL_TIMEOUT_MS);
     return;
   }
 
   // ── State: NAVIGATING_TARGET → gateway URL committed ──
   if (record && record.state === ST.NAVIGATING_TARGET && isGatewayUrl(url)) {
     record.url = url;
+    // Remove session allow rule now that navigation succeeded
+    await removeSessionAllowRule(tabId, record.captureId);
     startCaptureTimers(tabId, record);
-    await enableDnrRuleset();
     return;
   }
 
-  // ── State: NAVIGATING_TARGET → about:blank (DNR still active, bug) ──
-  if (record && record.state === ST.NAVIGATING_TARGET && url === 'about:blank') {
-    console.error('[CAPTURE] BUG: DNR re-intercept! Navigate to blank while DNR should be disabled.',
-      'tabId=', tabId, 'captureId=', record.captureId);
-    finishWithError(tabId, record.captureId, 'DNR re-intercept: DNR not disabled before Page.navigate');
-    return;
-  }
-
-  // ── State: USER_NAV_DETECTED → gateway URL committed (DNR didn't redirect) ──
-  if (record && record.state === ST.USER_NAV_DETECTED && isGatewayUrl(url)) {
-    transitionTo(record, ST.BLANK_COMMITTED, 'onCommitted(gateway, DNR bypass)');
-    try {
-      await setupCdp(tabId, record);
-      startCaptureTimers(tabId, record);
-    } catch (err) {
-      finishWithError(tabId, record.captureId, 'attach failed: ' + err.message);
-    }
-    return;
-  }
-
-  // ─ Non-gateway URL → ignore ──
+  // ── Non-gateway → ignore ──
   if (!isGatewayUrl(url)) return;
-
-  // ── Edge case: gateway URL committed without interception ──
-  if (!record) {
-    console.log('[CAPTURE] onCommitted: gateway URL without interception', Date.now(),
-      'tabId=', tabId, 'url=', url.slice(0, 120));
-    const newRecord = new CaptureRecord(tabId, url);
-    captures.set(tabId, newRecord);
-    transitionTo(newRecord, ST.BLANK_COMMITTED, 'onCommitted(gateway, no record)');
-    try {
-      await setupCdp(tabId, newRecord);
-      startCaptureTimers(tabId, newRecord);
-    } catch (err) {
-      finishWithError(tabId, newRecord.captureId, 'attach failed: ' + err.message);
-    }
-    return;
-  }
-
-  // ── COMPLETED/ERROR → clean up old, start fresh ──
-  if (record.state === ST.COMPLETED || record.state === ST.ERROR) {
-    await disposeRecord(tabId);
-    const newRecord = new CaptureRecord(tabId, url);
-    captures.set(tabId, newRecord);
-    transitionTo(newRecord, ST.BLANK_COMMITTED, 'onCommitted(gateway, after cleanup)');
-    try {
-      await setupCdp(tabId, newRecord);
-      startCaptureTimers(tabId, newRecord);
-    } catch (err) {
-      finishWithError(tabId, newRecord.captureId, 'attach failed: ' + err.message);
-    }
-  }
 });
 
 // ============================================================================
@@ -410,7 +377,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 async function handleCdpEvent(tabId, captureId, method, params) {
   const record = captures.get(tabId);
   if (!record || record.captureId !== captureId) return;
-  if (record.state !== ST.NAVIGATING_TARGET && record.state !== ST.CAPTURING) return;
+  if (record.state !== ST.READY && record.state !== ST.NAVIGATING_TARGET && record.state !== ST.CAPTURING) return;
 
   switch (method) {
     case 'Network.requestWillBeSent': {
@@ -993,6 +960,7 @@ async function detachDebugger(tabId, captureId) {
 
   if (record.idleTimer) { clearTimeout(record.idleTimer); record.idleTimer = null; }
   if (record.maxTimer) { clearTimeout(record.maxTimer); record.maxTimer = null; }
+  if (record.interstitialTimer) { clearTimeout(record.interstitialTimer); record.interstitialTimer = null; }
 
   if (record.onEvent) {
     chrome.debugger.onEvent.removeListener(record.onEvent);
@@ -1012,7 +980,7 @@ async function abortCapture(tabId, reason) {
   record.error = reason;
   record.durationMs = Date.now() - record.startedAt;
   webRequestLog.delete(record.captureId);
-  await enableDnrRuleset();  // restore DNR in case it was disabled
+  await removeSessionAllowRule(tabId, record.captureId);
   await detachDebugger(tabId, record.captureId);
   notifyPopup(tabId);
 }
@@ -1023,7 +991,7 @@ async function disposeRecord(tabId) {
   console.log('[CAPTURE] disposeRecord', Date.now(), 'tabId=', tabId,
     'captureId=', record.captureId);
   webRequestLog.delete(record.captureId);
-  await enableDnrRuleset();  // restore DNR in case it was disabled
+  await removeSessionAllowRule(tabId, record.captureId);
   await detachDebugger(tabId, record.captureId);
   captures.delete(tabId);
 }
@@ -1037,7 +1005,7 @@ async function finishWithError(tabId, captureId, error) {
   record.error = error;
   record.durationMs = Date.now() - record.startedAt;
   webRequestLog.delete(record.captureId);
-  await enableDnrRuleset();  // restore DNR in case it was disabled
+  await removeSessionAllowRule(tabId, captureId);
   await detachDebugger(tabId, captureId);
   notifyPopup(tabId);
 }
@@ -1058,9 +1026,16 @@ function notifyPopup(tabId) {
 }
 
 // ============================================================================
-// Message handling: popup ↔ background
+// Message handling: interstitialReady + popup ↔ background
 // ============================================================================
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // interstitialReady — blank.html 通知（无需 sendResponse）
+  if (msg.action === 'interstitialReady') {
+    handleInterstitialReady(sender.tab.id, msg.targetUrl);
+    return false;
+  }
+
+  // popup 消息
   (async () => {
     const tabId = msg.tabId ?? (await getActiveTabId());
     const record = tabId != null ? captures.get(tabId) : null;

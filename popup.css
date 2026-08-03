@@ -48,10 +48,12 @@ body {
 }
 
 .status-inactive          { background: var(--bg2); color: var(--muted); }
-.status-user_nav_detected  { background: #fff7ed; color: var(--warning); }
-.status-blank_committed    { background: #fff7ed; color: var(--warning); }
-.status-navigating_target  { background: #fff7ed; color: var(--warning); }
-.status-capturing          { background: #fff7ed; color: var(--warning); }
+.status-user_nav_detected       { background: #fff7ed; color: var(--warning); }
+.status-interstitial_committed  { background: #fff7ed; color: var(--warning); }
+.status-cdp_attaching           { background: #fff7ed; color: var(--warning); }
+.status-ready                   { background: #fff7ed; color: var(--warning); }
+.status-navigating_target       { background: #fff7ed; color: var(--warning); }
+.status-capturing               { background: #fff7ed; color: var(--warning); }
 .status-completed          { background: #eff6ff; color: var(--accent); }
 .status-error              { background: #fef2f2; color: var(--danger); }
 

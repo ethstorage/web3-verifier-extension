@@ -80,7 +80,8 @@ async function refreshState() {
       'captured=', s.counts?.captured, 'activeCaptureId=', activeCaptureId);
     updateStatus(s);
 
-    if (s.state === 'user_nav_detected' || s.state === 'blank_committed' ||
+    if (s.state === 'user_nav_detected' || s.state === 'interstitial_committed' ||
+        s.state === 'cdp_attaching' || s.state === 'ready' ||
         s.state === 'navigating_target' ||
         s.state === 'capturing') {
       await loadResults();
@@ -127,7 +128,9 @@ function updateStatus(s) {
       break;
 
     case 'user_nav_detected':
-    case 'blank_committed':
+    case 'interstitial_committed':
+    case 'cdp_attaching':
+    case 'ready':
     case 'navigating_target':
       $('statusIcon').textContent = '\u25CF';
       $('statusText').textContent = 'Setting up capture...';
