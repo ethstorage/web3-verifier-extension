@@ -361,23 +361,65 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
     startCaptureTimers(tabId, record);
     return;
   }
-
-  // ── Non-gateway → ignore ──
-  if (!isGatewayUrl(url)) return;
 });
 
 // ============================================================================
 // onErrorOccurred — navigation failure handling (P0-3)
 // ============================================================================
+// ERR_ABORTED is a normal byproduct of the capture flow's redirect-heavy
+// design (DNR redirect, Page.navigate, HTTP 3xx, SW interception). It must
+// NOT terminate the capture in pre-capture phases. Genuine network failures
+// (DNS/TLS/timeout/connection refused) remain fatal.
 chrome.webNavigation.onErrorOccurred.addListener((details) => {
   if (details.frameId !== 0) return;
   const record = captures.get(details.tabId);
   if (!record) return;
-  if (record.state !== ST.NAVIGATING_TARGET && record.state !== ST.READY) return;
-  console.error('[CAPTURE] navigation error', 'tabId=', details.tabId,
-    'error=', details.error, 'url=', (details.url || '').slice(0, 120));
-  finishWithError(details.tabId, record.captureId,
-    `navigation error: ${details.error}`);
+
+  const isAborted = details.error === 'net::ERR_ABORTED';
+
+  // Pre-capture phases: DNR redirect cancels the original navigation, and
+  // ERR_ABORTED is expected. Ignore all errors here — the interstitial /
+  // navigating watchdog timers handle true dead-ends.
+  if (record.state === ST.USER_NAV_DETECTED
+      || record.state === ST.INTERSTITIAL_COMMITTED
+      || record.state === ST.CDP_ATTACHING
+      || record.state === ST.READY) {
+    if (isAborted) {
+      console.warn('[CAPTURE] navigation aborted (pre-capture, ignored)',
+        'tabId=', details.tabId, 'state=', record.state,
+        'url=', (details.url || '').slice(0, 120));
+      return;
+    }
+    // Non-ABORTED errors in pre-capture phases are still fatal.
+    console.error('[CAPTURE] navigation error (pre-capture)',
+      'tabId=', details.tabId, 'state=', record.state,
+      'error=', details.error,
+      'url=', (details.url || '').slice(0, 120));
+    finishWithError(details.tabId, record.captureId,
+      `navigation error: ${details.error}`);
+    return;
+  }
+
+  // NAVIGATING_TARGET: Page.navigate(targetUrl) has been issued. ERR_ABORTED
+  // here typically comes from HTTP redirects, in-page jumps, or SW navigation
+  // handling — the subsequent onCommitted (or navigatingTimer watchdog) will
+  // determine the real outcome. Defer to those mechanisms.
+  if (record.state === ST.NAVIGATING_TARGET) {
+    if (isAborted) {
+      console.warn('[CAPTURE] navigation aborted (navigating target, ignored)',
+        'tabId=', details.tabId,
+        'url=', (details.url || '').slice(0, 120),
+        '→ awaiting onCommitted or navigatingTimer watchdog');
+      return;
+    }
+    console.error('[CAPTURE] navigation error (navigating target)',
+      'tabId=', details.tabId, 'error=', details.error,
+      'url=', (details.url || '').slice(0, 120));
+    finishWithError(details.tabId, record.captureId,
+      `navigation error: ${details.error}`);
+  }
+
+  // CAPTURING and terminal states: not navigation-related, ignore.
 });
 
 // ============================================================================
@@ -604,29 +646,6 @@ async function fetchBody(tabId, captureId, resourceKey) {
     }
 
     const size = validated.size;
-
-    // Sanity check: encoded length vs decoded body size mismatch → failedBody.
-    // Skip for compressed responses (gzip/br/deflate): CDP returns decompressed
-    // body while encodedDataLength reflects the compressed byte count, so the
-    // two are inherently different and comparing them would flag every
-    // compressed response as a failure.
-    const isCompressed = COMPRESSED_ENCODINGS.has(req.contentEncoding);
-    if (!isCompressed
-        && req.encodedDataLength != null && req.encodedDataLength > 0) {
-      const reported = req.encodedDataLength;
-      const tolerance = Math.max(32, reported * 0.25);
-      if (Math.abs(reported - size) > tolerance) {
-        console.warn('[CDP] body size mismatch',
-          'type=', req.type,
-          'reported=', reported, 'actual=', size,
-          'url=', req.url.slice(0, 80));
-        classifyAndAppendFailure(tabId, captureId, req, resourceKey, {
-          message: `body size mismatch: reported=${reported} actual=${size}`,
-        }, { bodyUnavailable: false, sizeMismatch: true });
-        return;
-      }
-    }
-
     appendResource(tabId, captureId, {
       url: req.url,
       type: req.type,
@@ -813,6 +832,21 @@ function doReconcile(tabId, captureId) {
       }
     }
 
+    // Final fallback: record.resources is the source of truth. A resource
+    // whose body was successfully appended is by definition captured, even
+    // if CDP requestWillBeSent was missed (e.g. browser-internal favicon
+    // fetch). Intermediate tracking (cdpDiscoveredResources) must not
+    // override the final captured-set evidence.
+    if (!cdpMatch) {
+      const baseUrl = normKey.split('|')[0];
+      for (const r of record.resources) {
+        if (r.url.startsWith(baseUrl)) {
+          cdpMatch = true;
+          break;
+        }
+      }
+    }
+
     if (!cdpMatch) {
       cdpMissed.push(wReq);
     }
@@ -824,6 +858,19 @@ function doReconcile(tabId, captureId) {
   for (const wReq of cdpMissed) {
     const normKey = wReq._normKey;
     const baseUrl = normKey.split('|')[0];
+
+    // Final fallback: check record.resources before declaring missing.
+    // cdpRequests may have been overwritten or never created for resources
+    // that still ended up captured (redirect, responseReceived fallback).
+    let captured = false;
+    for (const r of record.resources) {
+      if (r.url.startsWith(baseUrl)) {
+        captured = true;
+        break;
+      }
+    }
+    if (captured) continue;
+
     let cdpReq = null;
     for (const [, r] of record.cdpRequests) {
       const rNormKey = r._normKey || normalizeResourceKey(r.url, r.type);
@@ -839,12 +886,12 @@ function doReconcile(tabId, captureId) {
 
   record.missingResources = missingB;
 
-  // resourceCoverage — Resource Coverage only (docDiscovered && !hasMissing).
-  // bodyQuality is tracked separately and does NOT affect resourceCoverage.
+  // resourceCoverage — based on the final captured set (record.resources),
+  // not on intermediate tracking flags. docDiscovered is true when a
+  // Document resource is present in the captured set.
   // Missing resources are a coverage gap, NOT a pipeline error — record.error
   // is reserved exclusively for capture pipeline failures.
-  const docDiscovered = record.docCaptured
-    && record.documentRequestId != null;
+  const docDiscovered = record.resources.some(r => r.type === 'Document');
   const hasMissing = missingB.length > 0;
 
   if (docDiscovered && !hasMissing) {
@@ -856,12 +903,13 @@ function doReconcile(tabId, captureId) {
       'missingB=', missingB.length);
   }
 
-  // bodyQuality — Body Availability only (docBodyOk && !hasFailedBodies).
-  const docBodyOk = record.documentRequestId != null
-    && (() => {
-      const docReq = record.cdpRequests.get(record.documentRequestId);
-      return docReq != null && docReq.bodyFetchResult === 'success';
-    })();
+  // bodyQuality — based on the final captured set. docBodyOk is true when
+  // a Document resource with a non-null body is present. Intermediate
+  // bodyFetchResult / documentRequestId are debug-only and must not drive
+  // the final quality verdict.
+  const docBodyOk = record.resources.some(r =>
+    r.type === 'Document' && r.body != null
+  );
   const hasFailedBodies = record.failedBodies.length > 0;
 
   if (docBodyOk && !hasFailedBodies) {
