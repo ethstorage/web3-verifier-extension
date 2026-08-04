@@ -57,6 +57,35 @@ body {
 .status-completed          { background: #eff6ff; color: var(--accent); }
 .status-error              { background: #fef2f2; color: var(--danger); }
 
+/* ---- Structured capture info ---- */
+.capture-info {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: var(--bg2);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 2px 0;
+}
+.info-label {
+  color: var(--muted);
+  font-weight: 500;
+}
+.info-value {
+  color: var(--ink);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.info-value.is-complete { color: var(--success); }
+.info-value.is-partial  { color: var(--warning); }
+.info-value.is-failed   { color: var(--danger); }
+.info-row-missing .info-value { color: var(--danger); }
+
 /* ---- Summary ---- */
 #summary { margin-bottom: 12px; }
 .summary-grid {

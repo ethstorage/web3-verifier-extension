@@ -14,6 +14,26 @@
       <span id="statusTime" class="status-time"></span>
     </div>
 
+    <!-- Structured capture info: status / coverage / body / missing -->
+    <div id="captureInfo" class="capture-info hidden">
+      <div class="info-row">
+        <span class="info-label">Capture Status</span>
+        <span class="info-value" id="infoStatus">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Resource Coverage</span>
+        <span class="info-value" id="infoCoverage">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Body Availability</span>
+        <span class="info-value" id="infoBody">—</span>
+      </div>
+      <div class="info-row info-row-missing hidden" id="infoMissingRow">
+        <span class="info-label">Missing Resources</span>
+        <span class="info-value" id="infoMissing">0</span>
+      </div>
+    </div>
+
     <!-- Summary: file count + total size + actions -->
     <div id="summary" class="hidden">
       <div class="summary-grid">

@@ -120,6 +120,7 @@ function updateStatus(s) {
       $('statusIcon').textContent = '\u2299';
       $('statusText').textContent = 'Waiting for gateway page...';
       $('statusTime').textContent = '';
+      hide($('captureInfo'));
       hide($('summary'));
       hide($('results'));
       break;
@@ -132,37 +133,79 @@ function updateStatus(s) {
       $('statusIcon').textContent = '\u25CF';
       $('statusText').textContent = 'Setting up capture...';
       $('statusTime').textContent = '';
+      hide($('captureInfo'));
       break;
 
     case 'capturing':
       $('statusIcon').textContent = '\u25CF';
       $('statusText').textContent = 'Capturing gateway traffic...';
       $('statusTime').textContent = captured > 0 ? 'Captured ' + captured + ', waiting for idle' : '';
+      hide($('captureInfo'));
       break;
 
     case 'completed':
-      $('statusIcon').textContent = '\u2713';
+    case 'error':
+      $('statusIcon').textContent = s.state === 'completed' ? '\u2713' : '\u2717';
+      $('statusText').textContent = s.state === 'completed' ? 'Capture Completed' : (s.error || 'Error occurred');
       {
-        let qualityText = '';
-        if (s.captureQuality === 'complete') qualityText = 'Complete';
-        else if (s.captureQuality === 'partial') qualityText = 'Partial';
         const gatewayText = s.gatewayName ? ' \u2022 ' + s.gatewayName : '';
-        $('statusText').textContent = 'Capture ' + (qualityText || 'done');
         let timeInfo = '';
         if (s.durationMs) timeInfo = (s.durationMs / 1000).toFixed(1) + 's';
-        if (missed > 0) timeInfo += ' \u2022 ' + missed + ' missed';
-        if (bodyFetchErrors > 0) timeInfo += ' \u2022 ' + bodyFetchErrors + ' fetch err';
+        if (captured > 0) timeInfo += (timeInfo ? ' \u2022 ' : '') + captured + ' files';
         $('statusTime').textContent = (timeInfo || '') + gatewayText;
+
+        renderCaptureInfo(s, missed, bodyFetchErrors);
       }
       break;
-
-    case 'error':
-      $('statusIcon').textContent = '\u2717';
-      $('statusText').textContent = s.error || 'Error occurred';
-      $('statusTime').textContent = (captured > 0 ? 'Captured ' + captured : '')
-        + (bodyFetchErrors > 0 ? ' \u2022 ' + bodyFetchErrors + ' fetch err' : '');
-      break;
   }
+}
+
+// ---- Structured capture info (status / coverage / body / missing) ----
+function renderCaptureInfo(s, missed, bodyFetchErrors) {
+  const isCompleted = s.state === 'completed';
+  const statusEl = $('infoStatus');
+  const coverageEl = $('infoCoverage');
+  const bodyEl = $('infoBody');
+  const missingRowEl = $('infoMissingRow');
+  const missingEl = $('infoMissing');
+
+  // Row 1 — Capture Status
+  statusEl.textContent = isCompleted ? 'Completed' : 'Failed';
+  statusEl.className = 'info-value' + (isCompleted ? ' is-complete' : ' is-failed');
+
+  // Row 2 — Resource Coverage
+  if (s.resourceCoverage === 'complete' || s.resourceCoverage === 'partial') {
+    coverageEl.textContent = s.resourceCoverage === 'complete' ? 'Complete' : 'Partial';
+    coverageEl.className = 'info-value'
+      + (s.resourceCoverage === 'complete' ? ' is-complete' : ' is-partial');
+  } else {
+    coverageEl.textContent = '—';
+    coverageEl.className = 'info-value';
+  }
+
+  // Row 3 — Body Availability
+  if (s.bodyQuality === 'complete' || s.bodyQuality === 'partial') {
+    let bodyText = s.bodyQuality === 'complete' ? 'Complete' : 'Partial';
+    if (s.bodyQuality === 'partial' && bodyFetchErrors > 0) {
+      bodyText += ' (' + bodyFetchErrors + (bodyFetchErrors === 1 ? ' error' : ' errors') + ')';
+    }
+    bodyEl.textContent = bodyText;
+    bodyEl.className = 'info-value'
+      + (s.bodyQuality === 'complete' ? ' is-complete' : ' is-partial');
+  } else {
+    bodyEl.textContent = '—';
+    bodyEl.className = 'info-value';
+  }
+
+  // Optional row — Missing Resources count (shown only when > 0)
+  if (missed > 0) {
+    missingEl.textContent = missed;
+    show(missingRowEl);
+  } else {
+    hide(missingRowEl);
+  }
+
+  show($('captureInfo'));
 }
 
 // ---- Load and display results (shared by capturing/completed) ----
