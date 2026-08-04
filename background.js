@@ -94,6 +94,107 @@ function transitionTo(record, newState, event) {
 }
 
 // ============================================================================
+// Terminal-state persistence (MV3 service worker restart resilience)
+// ============================================================================
+// Only terminal-state summaries (COMPLETED / ERROR) are persisted to
+// chrome.storage.session. Raw bodies are NEVER persisted — only the fields
+// popup needs to display results. session storage survives SW restarts but
+// is cleared when the browser closes, which matches the use case.
+const CAPTURE_STORAGE_PREFIX = 'capture:';
+
+function captureStorageKey(tabId) {
+  return CAPTURE_STORAGE_PREFIX + tabId;
+}
+
+// Build a popup-ready summary from a CaptureRecord. Excludes raw bodies so
+// the persisted payload stays small.
+function buildPersistedSummary(record) {
+  return {
+    captureId: record.captureId,
+    tabId: record.tabId,
+    url: record.url,
+    state: record.state,
+    gatewayId: record.gatewayId,
+    gatewayName: record.gatewayName,
+    resourceCoverage: record.resourceCoverage,
+    bodyQuality: record.bodyQuality,
+    durationMs: record.durationMs,
+    error: record.error,
+    startedAt: record.startedAt,
+    completedAt: Date.now(),
+    counts: {
+      captured: record.resources.length,
+      failedBodies: record.failedBodies.length,
+      missed: record.missingResources.length,
+    },
+    // Resources without body/base64Encoded — popup never requests bodies.
+    resources: record.resources.map(({ body, base64Encoded, ...rest }) => rest),
+    failedBodies: record.failedBodies.map(r => ({
+      url: r.url,
+      type: r.type,
+      bodyUnavailable: r.bodyUnavailable,
+      sizeMismatch: r.sizeMismatch,
+    })),
+    missingResources: record.missingResources.map(r => ({
+      url: r.url,
+      type: r.type,
+      timeStamp: r.timeStamp,
+    })),
+    summary: {
+      total: record.resources.length,
+      totalSize: record.resources.reduce((s, r) => s + r.size, 0),
+      failedBodies: record.failedBodies.length,
+      missed: record.missingResources.length,
+      byType: groupByType(record.resources),
+    },
+  };
+}
+
+async function persistCaptureSummary(record) {
+  try {
+    const summary = buildPersistedSummary(record);
+    await chrome.storage.session.set({ [captureStorageKey(record.tabId)]: summary });
+    console.log('[CAPTURE_PERSIST]',
+      'tabId=', record.tabId,
+      'captureId=', record.captureId,
+      'state=', record.state);
+  } catch (e) {
+    console.warn('[CAPTURE_PERSIST] failed',
+      'tabId=', record.tabId,
+      'err=', e.message);
+  }
+}
+
+async function restoreCaptureSummary(tabId) {
+  try {
+    const result = await chrome.storage.session.get(captureStorageKey(tabId));
+    const summary = result[captureStorageKey(tabId)];
+    if (summary) {
+      console.log('[CAPTURE_RESTORE]',
+        'tabId=', tabId,
+        'captureId=', summary.captureId,
+        'state=', summary.state);
+    }
+    return summary || null;
+  } catch (e) {
+    console.warn('[CAPTURE_RESTORE] failed',
+      'tabId=', tabId,
+      'err=', e.message);
+    return null;
+  }
+}
+
+async function clearPersistedCapture(tabId) {
+  try {
+    await chrome.storage.session.remove(captureStorageKey(tabId));
+  } catch (e) {
+    console.warn('[CAPTURE_PERSIST] clear failed',
+      'tabId=', tabId,
+      'err=', e.message);
+  }
+}
+
+// ============================================================================
 // CaptureRecord
 // ============================================================================
 class CaptureRecord {
@@ -359,7 +460,6 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
     // Remove session allow rule now that navigation succeeded
     await removeSessionAllowRule(tabId, record.captureId);
     startCaptureTimers(tabId, record);
-    return;
   }
 });
 
@@ -966,6 +1066,7 @@ async function completeCapture(tabId, captureId) {
     'durationMs=', record.durationMs);
 
   await detachDebugger(tabId, captureId);
+  await persistCaptureSummary(record);
   notifyPopup(tabId);
 }
 
@@ -1001,6 +1102,7 @@ async function abortCapture(tabId, reason) {
   webRequestLog.delete(record.captureId);
   await removeSessionAllowRule(tabId, record.captureId);
   await detachDebugger(tabId, record.captureId);
+  await persistCaptureSummary(record);
   notifyPopup(tabId);
 }
 
@@ -1012,6 +1114,9 @@ async function disposeRecord(tabId) {
   webRequestLog.delete(record.captureId);
   await removeSessionAllowRule(tabId, record.captureId);
   await detachDebugger(tabId, record.captureId);
+  // Clear any persisted terminal-state summary so a tab ID reused by Chrome
+  // after close does not surface stale capture data.
+  await clearPersistedCapture(tabId);
   captures.delete(tabId);
 }
 
@@ -1026,6 +1131,7 @@ async function finishWithError(tabId, captureId, error) {
   webRequestLog.delete(record.captureId);
   await removeSessionAllowRule(tabId, captureId);
   await detachDebugger(tabId, captureId);
+  await persistCaptureSummary(record);
   notifyPopup(tabId);
 }
 
@@ -1058,6 +1164,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     const tabId = msg.tabId ?? (await getActiveTabId());
     const record = tabId != null ? captures.get(tabId) : null;
+    // Fallback to session storage when the in-memory record is missing
+    // (e.g. after MV3 service worker restart). Only terminal-state summaries
+    // are persisted, so in-flight captures are never falsely restored.
+    const persisted = (!record && tabId != null)
+      ? await restoreCaptureSummary(tabId)
+      : null;
 
     switch (msg.action) {
       case 'getState': {
@@ -1078,6 +1190,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 failedBodies: record.failedBodies.length,
                 missed: record.missingResources.length,
               },
+            },
+          });
+        } else if (persisted) {
+          sendResponse({
+            state: {
+              state: persisted.state,
+              url: persisted.url,
+              gatewayId: persisted.gatewayId,
+              gatewayName: persisted.gatewayName,
+              resourceCoverage: persisted.resourceCoverage,
+              bodyQuality: persisted.bodyQuality,
+              durationMs: persisted.durationMs,
+              error: persisted.error,
+              captureId: persisted.captureId,
+              counts: persisted.counts,
             },
           });
         } else {
@@ -1119,6 +1246,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               missed: record.missingResources.length,
               byType: groupByType(record.resources),
             },
+          });
+        } else if (persisted) {
+          // Restored summaries never carry raw bodies (size only) — withBody
+          // is therefore ignored for restored data.
+          sendResponse({
+            url: persisted.url,
+            gatewayId: persisted.gatewayId,
+            gatewayName: persisted.gatewayName,
+            durationMs: persisted.durationMs,
+            state: persisted.state,
+            resourceCoverage: persisted.resourceCoverage,
+            bodyQuality: persisted.bodyQuality,
+            captureId: persisted.captureId,
+            resources: persisted.resources,
+            failedBodies: persisted.failedBodies,
+            missingResources: persisted.missingResources,
+            summary: persisted.summary,
           });
         } else {
           sendResponse({
